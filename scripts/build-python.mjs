@@ -73,6 +73,7 @@ run(VENV_PY, [
   '--hidden-import', 'research_c15',
   '--hidden-import', 'research_c15_live',
   '--hidden-import', 'research_md',
+  '--hidden-import', 'research_preflight',
   '--add-data', `research_build_manifest.json${process.platform === 'win32' ? ';' : ':'}.`,
   '--hidden-import', 'crossvenue',
   '--hidden-import', 'polymarket_public',

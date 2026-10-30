@@ -561,3 +561,26 @@ def test_old_instant_of_a_tracked_market_falls_back_to_disk_after_trim(env):
     x.evidence_barrier(TICKER)
     x.stream.trim(clock() + timedelta(minutes=1))   # memory no longer reaches `probe`
     assert x.tape_for(TICKER, probe).state_at(probe, confirmed=True) == before
+
+
+def test_switch_file_enables_without_config_key(env, monkeypatch):
+    conn, clock, spot, tmp = env
+    import research_preflight as pf
+    (pf.data_dir() / pf.SWITCH_NAME).write_text(json.dumps({"enabled": True}))
+    import kalshi_auth
+    monkeypatch.setattr(kalshi_auth, "is_paper", lambda env=None: True)
+    clock.t = CLOSE - timedelta(seconds=70)
+    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
+
+    async def go():
+        stop = asyncio.Event()
+        task = asyncio.ensure_future(live.run(
+            lambda: {}, stop, make_md=lambda on_event, on_cf: FakeMD(on_event, clock),
+            send=SettlingKalshi(clock), candle_post=candles(clock), clock=clock, spot_reads=fresh,
+            prints=lambda c, n: (0.0, 0, "none"), local_time=lambda: clock().timestamp(),
+            tick_s=0.005))
+        await asyncio.sleep(0.4)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    asyncio.run(go())
+    assert conn.execute("SELECT status FROM rx_cohorts").fetchone()[0] == "active"

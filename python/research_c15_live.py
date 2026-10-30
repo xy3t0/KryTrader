@@ -439,8 +439,10 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
         conn.execute("BEGIN IMMEDIATE")
         mid = rx.ensure_manifest(conn, body, clock())
         cfg = cfg_getter() or {}
-        accepting_mid = rx.select_cohort(conn, mid, activate=cfg.get("research_c15_activate"),
-                                         now=clock())
+        import research_preflight as _pf
+        accepting_mid = rx.select_cohort(
+            conn, mid, activate=cfg.get("research_c15_activate") or _pf.read_switch()["activate"],
+            now=clock())
         if accepting_mid:
             rx.setup_wallets(conn, accepting_mid)
         conn.commit()
@@ -459,9 +461,12 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
         live.md = make_md(live.on_book_event, live.cf.handle_message)
         md_task = asyncio.ensure_future(live.md.run(md_stop))
 
+        import research_preflight
+
         def enabled() -> bool:
             c = cfg_getter() or {}
-            return bool(c.get("research_c15_enabled")) and kalshi_auth.is_paper()
+            on = bool(c.get("research_c15_enabled")) or research_preflight.read_switch()["enabled"]
+            return on and kalshi_auth.is_paper()
 
         def accepting_for(m):
             def f():

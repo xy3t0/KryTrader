@@ -1235,7 +1235,9 @@ def _spawn_research_c15() -> None:
     if _rx_task is not None and not _rx_task.done():
         return
     cfg = STATE.cfg or {}
-    want = bool(cfg.get("research_c15_enabled")) and kalshi_auth.is_paper()
+    import research_preflight
+    want = ((bool(cfg.get("research_c15_enabled")) or research_preflight.read_switch()["enabled"])
+            and kalshi_auth.is_paper())
     if not want:
         try:
             with db.get_db() as conn:
@@ -3421,6 +3423,9 @@ def _selftest() -> int:
         "forecast_ledger", "paper_book", "paper_exchange", "shard_rail", "mcp_server", "mcp_bridge",
         "mcp_workbench", "mcp_agents", "autopilot", "health", "kalshi_key_check",
         "capturetrail",
+        "fees", "fee_schedule", "fee_capture", "fee_ledger", "fee_context", "fee_service",
+        "research_wallet", "execution_gate", "sim_exec", "research_md", "research_c15",
+        "research_c15_live", "research_preflight",
     ]
     import importlib
     for name in mods:
@@ -3456,6 +3461,14 @@ def _selftest() -> int:
         failures.append(f"websocket TLS check: {type(e).__name__}: {e}")
 
     try:
+        import research_c15
+        ident = research_c15.code_identity()
+        if getattr(sys, "frozen", False) and ident.get("mode") != "bundled":
+            failures.append("research manifest: frozen build is not using the bundled manifest")
+    except Exception as e:
+        failures.append(f"research manifest: {type(e).__name__}: {e}")
+
+    try:
         import ai_providers
         failures.extend(f"AI SDK: {f}" for f in ai_providers.sdk_selfcheck())
     except Exception as e:
@@ -3474,6 +3487,14 @@ if __name__ == "__main__":
     _mp.freeze_support()
     if "--selftest" in sys.argv[1:]:
         sys.exit(_selftest())
+    if "--research-preflight" in sys.argv[1:]:
+        import research_preflight
+        sys.exit(research_preflight.main())
+    if "--research-enable" in sys.argv[1:] or "--research-disable" in sys.argv[1:]:
+        import research_preflight
+        args = sys.argv[1:]
+        act = args[args.index("--activate") + 1] if "--activate" in args[:-1] else None
+        sys.exit(research_preflight.set_switch("--research-enable" in args, act))
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
