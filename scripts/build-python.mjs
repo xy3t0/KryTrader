@@ -57,6 +57,7 @@ run(VENV_PY, [
   '--hidden-import', 'fee_schedule',
   '--hidden-import', 'fee_capture',
   '--hidden-import', 'fee_ledger',
+  '--hidden-import', 'fee_context',
   '--hidden-import', 'crossvenue',
   '--hidden-import', 'polymarket_public',
   '--hidden-import', 'remote',

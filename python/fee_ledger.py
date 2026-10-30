@@ -185,6 +185,8 @@ def legacy_source_migrations() -> list[str]:
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create ledger tables and mark legacy fee columns. Idempotent."""
     conn.executescript(SCHEMA)
+    import fee_context  # account registry (A1)
+    fee_context.init_schema(conn)
     for stmt in legacy_source_migrations():
         try:
             conn.execute(stmt)
