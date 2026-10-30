@@ -25,10 +25,13 @@ Identity
                   by the database, not only by code.
 
 Transactions
-  apply_model_fill() runs inside a SAVEPOINT on the caller's connection: the
-  order-state read, the fill insert and the accumulator update commit or
-  roll back together. (If the connection has no open transaction, the
-  savepoint is the transaction and RELEASE commits it.) The order-state update is guarded by a version number
+  apply_model_fill() requires an open transaction on the caller's
+  connection (conn.in_transaction; entering db.get_db() alone does not
+  start one) and works inside a SAVEPOINT: the order-state read, the fill
+  insert and the accumulator update roll back together on error, and the
+  caller's transaction decides whether they commit alongside its own
+  cash/position/evidence writes. Each order is bound to one market, side
+  and action; maker/taker may vary by fill. The order-state update is guarded by a version number
   (compare-and-set), so two writers cannot both advance the same
   accumulator. The caller's transaction (e.g. db.get_db()) commits.
 """
@@ -59,6 +62,9 @@ CREATE TABLE IF NOT EXISTS fee_order_state (
     kalshi_env TEXT NOT NULL CHECK (kalshi_env IN ('production', 'paper')),
     account_id TEXT NOT NULL CHECK (length(account_id) > 0),
     order_id TEXT NOT NULL CHECK (length(order_id) > 0),
+    ticker TEXT NOT NULL CHECK (length(ticker) > 0),     -- the order's market
+    side TEXT NOT NULL CHECK (side IN ('yes', 'no')),
+    action TEXT NOT NULL CHECK (action IN ('buy', 'sell')),
     precision TEXT NOT NULL,                   -- decimal string, e.g. '0.0001'
     precision_source TEXT NOT NULL CHECK (precision_source IN ('configured', 'api_verified')),
     accumulator TEXT,                          -- decimal string; NULL = unknown
@@ -143,10 +149,14 @@ CREATE INDEX IF NOT EXISTS idx_fee_exchange_subject
 CREATE TABLE IF NOT EXISTS fee_evidence_refs (
     evidence_ref TEXT NOT NULL CHECK (length(evidence_ref) > 0),
     kalshi_env TEXT NOT NULL CHECK (kalshi_env IN ('production', 'paper')),
+    -- Account-scoped referrers (fill, order, trade) carry their account;
+    -- app-scoped referrers (forecast, evaluation) use ''.
+    account_id TEXT NOT NULL,
     referrer_kind TEXT NOT NULL CHECK (referrer_kind IN ('fill', 'order', 'trade', 'forecast', 'evaluation')),
     referrer_id TEXT NOT NULL CHECK (length(referrer_id) > 0),
     created_at TEXT NOT NULL,
-    PRIMARY KEY (evidence_ref, referrer_kind, referrer_id)
+    PRIMARY KEY (evidence_ref, kalshi_env, account_id, referrer_kind, referrer_id),
+    CHECK ((referrer_kind IN ('fill', 'order', 'trade')) = (length(account_id) > 0))
 );
 """
 
@@ -252,6 +262,9 @@ class OrderStateRow:
     kalshi_env: str
     account_id: str
     order_id: str
+    ticker: str
+    side: str
+    action: str
     precision: Decimal
     precision_source: str
     accumulator: Optional[Decimal]
@@ -264,14 +277,14 @@ def get_order_state(conn: sqlite3.Connection, *, kalshi_env: str, account_id: st
                     order_id: str) -> Optional[OrderStateRow]:
     r = conn.execute(
         "SELECT precision, precision_source, accumulator, accumulator_status, "
-        "unknown_reason, version FROM fee_order_state "
+        "unknown_reason, version, ticker, side, action FROM fee_order_state "
         "WHERE kalshi_env=? AND account_id=? AND order_id=?",
         (_env(kalshi_env), _id(account_id, "account_id"), _id(order_id, "order_id")),
     ).fetchone()
     if r is None:
         return None
     return OrderStateRow(
-        kalshi_env, account_id, order_id,
+        kalshi_env, account_id, order_id, ticker=r[6], side=r[7], action=r[8],
         precision=fees.to_decimal(r[0], "precision"), precision_source=r[1],
         accumulator=None if r[2] is None else fees.to_decimal(r[2], "accumulator"),
         accumulator_status=r[3], unknown_reason=r[4], version=int(r[5]),
@@ -314,6 +327,14 @@ def apply_model_fill(
         raise FeeLedgerError("ticker required")
     if not isinstance(resolution, fs.FeeResolution) or resolution.role != role:
         raise FeeLedgerError("resolution must be a FeeResolution for this fill's role")
+    if not isinstance(resolution.market_ticker, str) or not resolution.market_ticker:
+        raise FeeLedgerError("resolution has no market identity")
+    if resolution.market_ticker != ticker:
+        raise FeeLedgerError(
+            f"resolution is for market {resolution.market_ticker!r}, fill is on {ticker!r}")
+    if not conn.in_transaction:
+        raise FeeLedgerError(
+            "apply_model_fill needs an open transaction (BEGIN first); the caller owns commit")
     if not isinstance(filled_at, datetime) or filled_at.tzinfo is None:
         raise FeeLedgerError("filled_at must be timezone-aware")
     if resolution.at != filled_at.astimezone(timezone.utc):
@@ -332,14 +353,19 @@ def apply_model_fill(
         state = get_order_state(conn, kalshi_env=env, account_id=acct, order_id=oid)
         if state is None:
             conn.execute(
-                "INSERT INTO fee_order_state (kalshi_env, account_id, order_id, precision, "
-                "precision_source, accumulator, accumulator_status, version, created_at, "
-                "updated_at) VALUES (?,?,?,?,?,?, 'known', 0, ?, ?)",
-                (env, acct, oid, str(prec), precision_source, "0", now, now),
+                "INSERT INTO fee_order_state (kalshi_env, account_id, order_id, ticker, side, "
+                "action, precision, precision_source, accumulator, accumulator_status, version, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?, 'known', 0, ?, ?)",
+                (env, acct, oid, ticker, side, action, str(prec), precision_source, "0", now, now),
             )
             state = get_order_state(conn, kalshi_env=env, account_id=acct, order_id=oid)
         if state.precision != prec or state.precision_source != precision_source:
             raise FeeLedgerError("precision/precision_source differ from the order's recorded state")
+        # One order, one instrument and direction; maker/taker may change per fill.
+        for name, mine, theirs in (("ticker", ticker, state.ticker), ("side", side, state.side),
+                                   ("action", action, state.action)):
+            if mine != theirs:
+                raise FeeLedgerError(f"order {oid} is {name}={theirs!r}; fill has {name}={mine!r}")
 
         fee: Optional[fees.FillFeeResult] = None
         new_status, new_acc, reason = state.accumulator_status, state.accumulator, state.unknown_reason
@@ -400,15 +426,28 @@ def apply_model_fill(
 REFERRER_KINDS = ("fill", "order", "trade", "forecast", "evaluation")
 
 
+ACCOUNT_SCOPED_REFERRERS = ("fill", "order", "trade")
+
+
 def add_evidence_ref(conn: sqlite3.Connection, *, evidence_ref: str, kalshi_env: str,
-                     referrer_kind: str, referrer_id: str) -> None:
-    """Mark evidence as referenced (retention). Idempotent."""
+                     referrer_kind: str, referrer_id: str,
+                     account_id: Optional[str] = None) -> None:
+    """Mark evidence as referenced (retention). Exact duplicates are
+    idempotent; the same evidence may be referenced from different
+    environments, accounts and referrers. account_id is required for
+    account-scoped referrers (fill, order, trade) and refused otherwise."""
     if referrer_kind not in REFERRER_KINDS:
         raise FeeLedgerError(f"referrer_kind must be one of {REFERRER_KINDS}")
+    if referrer_kind in ACCOUNT_SCOPED_REFERRERS:
+        acct = _id(account_id, "account_id")
+    elif account_id is not None:
+        raise FeeLedgerError(f"{referrer_kind} references are not account-scoped")
+    else:
+        acct = ""
     conn.execute(
-        "INSERT OR IGNORE INTO fee_evidence_refs (evidence_ref, kalshi_env, referrer_kind, "
-        "referrer_id, created_at) VALUES (?,?,?,?,?)",
-        (_id(evidence_ref, "evidence_ref"), _env(kalshi_env), referrer_kind,
+        "INSERT OR IGNORE INTO fee_evidence_refs (evidence_ref, kalshi_env, account_id, "
+        "referrer_kind, referrer_id, created_at) VALUES (?,?,?,?,?,?)",
+        (_id(evidence_ref, "evidence_ref"), _env(kalshi_env), acct, referrer_kind,
          _id(referrer_id, "referrer_id"), _now()),
     )
 

@@ -539,6 +539,7 @@ class FeeResolution:
     reason: str
     role: str
     at: datetime
+    market_ticker: str = ""           # the market this resolution is for; required by consumers
     fee_type: Optional[str] = None
     multiplier: Optional[Decimal] = None
     coefficient: Optional[Decimal] = None  # only for RESOLVED / EXPLICIT_ZERO
@@ -666,6 +667,7 @@ def resolve_fee_schedule(
 
     def out(status: str, reason: str, **kw) -> FeeResolution:
         return FeeResolution(status=status, reason=reason, role=role, at=at,
+                             market_ticker=market.ticker,
                              assumptions=assumptions, provenance=prov, **kw)
 
     stale = sorted(k for k, a in inputs.items() if at > a.hi + ttl)

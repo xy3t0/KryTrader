@@ -36,18 +36,30 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
-def res(status=fs.RESOLVED, coeff="0.07", role="taker", at=T, assumptions=("a1",), reason="ok"):
-    return fs.FeeResolution(status=status, reason=reason, role=role, at=at,
+TICKER = "KXBTC15M-X"
+
+
+def res(status=fs.RESOLVED, coeff="0.07", role="taker", at=T, assumptions=("a1",), reason="ok",
+        market=TICKER):
+    return fs.FeeResolution(status=status, reason=reason, role=role, at=at, market_ticker=market,
                             coefficient=None if coeff is None else D(coeff),
                             assumptions=assumptions, provenance={"at": at, "ttl": timedelta(minutes=5)})
 
 
+def begin(conn):
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+
+
 def apply(conn, fill_id="f1", order_id="o1", precision=DIRECT, price="0.97", count="1",
-          role="taker", action="buy", resolution=None, at=T, account="paper-local", env="paper"):
+          role="taker", action="buy", resolution=None, at=T, account="paper-local", env="paper",
+          ticker=TICKER, side="yes", auto_begin=True):
+    if auto_begin:
+        begin(conn)
     return fl.apply_model_fill(
         conn, kalshi_env=env, account_id=account, order_id=order_id, fill_id=fill_id,
-        precision=precision, precision_source="configured", ticker="KXBTC15M-X",
-        side="yes", action=action, role=role, price=price, count=count, filled_at=at,
+        precision=precision, precision_source="configured", ticker=ticker,
+        side=side, action=action, role=role, price=price, count=count, filled_at=at,
         resolution=resolution or res(role=role, at=at),
     )
 
@@ -84,14 +96,14 @@ def test_existing_rows_become_legacy_on_upgrade(tmp_path, monkeypatch):
 
 def test_order_state_check_known_iff_accumulator(conn):
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO fee_order_state VALUES ('paper','a','o','0.01','configured',"
-                     "NULL,'known',NULL,0,'t','t')")
+        conn.execute("INSERT INTO fee_order_state VALUES ('paper','a','o','T','yes','buy','0.01',"
+                     "'configured',NULL,'known',NULL,0,'t','t')")
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO fee_order_state VALUES ('paper','a','o','0.01','configured',"
-                     "'0','unknown','r',0,'t','t')")
+        conn.execute("INSERT INTO fee_order_state VALUES ('paper','a','o','T','yes','buy','0.01',"
+                     "'configured','0','unknown','r',0,'t','t')")
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO fee_order_state VALUES ('demo','a','o','0.01','configured',"
-                     "'0','known',NULL,0,'t','t')")
+        conn.execute("INSERT INTO fee_order_state VALUES ('demo','a','o','T','yes','buy','0.01',"
+                     "'configured','0','known',NULL,0,'t','t')")
 
 
 def _report(conn, kind="fill", subject="fill-1", state="reported", value="0.0021", field="fee_cost"):
@@ -140,11 +152,12 @@ def test_apply_model_fill_persists_exact_values(conn):
 def test_accumulator_carries_and_rebate_persists_across_fills(conn):
     rr = res(coeff="0.000001", assumptions=())   # tiny coefficient: model fee ~0
     results = []
+    begin(conn)
     for i in range(3):
         results.append(fl.apply_model_fill(
             conn, kalshi_env="paper", account_id="paper-local", order_id="o1",
             fill_id=f"f{i}", precision=NONDIRECT, precision_source="configured",
-            ticker="T", side="yes", action="buy", role="taker", price="0.05", count="1",
+            ticker=TICKER, side="yes", action="buy", role="taker", price="0.05", count="1",
             filled_at=T, resolution=rr))
     # Same arithmetic as settling the three fills on one in-memory order.
     st = fees.OrderFeeState("o1", NONDIRECT)
@@ -253,7 +266,7 @@ def test_evidence_refs_idempotent_and_queryable(conn):
     assert not fl.is_evidence_referenced(conn, "cap1")
     for _ in range(2):
         fl.add_evidence_ref(conn, evidence_ref="cap1", kalshi_env="paper",
-                            referrer_kind="fill", referrer_id="f1")
+                            referrer_kind="fill", referrer_id="f1", account_id="paper-local")
     assert fl.is_evidence_referenced(conn, "cap1")
     assert rows(conn, "SELECT COUNT(*) FROM fee_evidence_refs")[0][0] == 1
     with pytest.raises(fl.FeeLedgerError):
@@ -267,3 +280,125 @@ def test_exact_micro():
     assert fl.exact_micro(None) is None
     with pytest.raises(fl.FeeLedgerError):
         fl.exact_micro(D("0.0000001"))
+
+
+# ---- review fixes for f3509c5 -------------------------------------------------
+
+def _counts(conn):
+    return (rows(conn, "SELECT COUNT(*) FROM fee_fill_model")[0][0],
+            rows(conn, "SELECT COUNT(*) FROM fee_order_state")[0][0])
+
+
+def test_resolution_for_another_market_is_refused(conn):
+    # Codex repro: a zero-fee resolution for OTHER recorded on this market.
+    zero_other = res(status=fs.EXPLICIT_ZERO, coeff="0", market="OTHER", reason="multiplier_zero")
+    with pytest.raises(fl.FeeLedgerError):
+        apply(conn, resolution=zero_other)
+    assert _counts(conn) == (0, 0)
+
+
+def test_resolution_without_market_identity_is_refused(conn):
+    with pytest.raises(fl.FeeLedgerError):
+        apply(conn, resolution=res(market=""))
+    assert _counts(conn) == (0, 0)
+
+
+def test_resolver_output_carries_market_identity():
+    r = fs.FeeResolution(status=fs.RESOLVED, reason="ok", role="taker", at=T)
+    assert r.market_ticker == ""   # default is empty, so the ledger refuses it
+
+
+@pytest.mark.parametrize("kw", [
+    dict(ticker="KXETH15M-X"),       # other market
+    dict(side="no"),                 # other side
+    dict(action="sell"),             # other direction
+])
+def test_order_bound_to_market_side_and_action(conn, kw):
+    apply(conn, fill_id="f1")
+    before = fl.get_order_state(conn, kalshi_env="paper", account_id="paper-local", order_id="o1")
+    r = res(market=kw.get("ticker", TICKER))
+    with pytest.raises(fl.FeeLedgerError):
+        apply(conn, fill_id="f2", resolution=r, **kw)
+    assert fl.get_order_state(conn, kalshi_env="paper", account_id="paper-local",
+                              order_id="o1") == before
+    assert _counts(conn) == (1, 1)
+
+
+def test_maker_taker_transition_on_one_order_still_allowed(conn):
+    apply(conn, fill_id="f1", role="taker")
+    r2 = apply(conn, fill_id="f2", role="maker",
+               resolution=res(status=fs.EXPLICIT_ZERO, coeff="0", role="maker",
+                              reason="no_maker_fee_for_type"))
+    assert r2.order_state.version == 2 and r2.fee.trade_fee == 0
+
+
+def test_requires_open_transaction(conn):
+    assert not conn.in_transaction
+    with pytest.raises(fl.FeeLedgerError):
+        apply(conn, auto_begin=False)
+    assert _counts(conn) == (0, 0)
+
+
+def test_caller_rollback_after_successful_apply_discards_everything(conn):
+    # Codex repro: apply then rollback used to leave the fill committed.
+    begin(conn)
+    apply(conn)
+    conn.execute("INSERT INTO paper_fills (ticker, side, kind, contracts, price_cents, fee_usd, "
+                 "cash_delta_usd) VALUES (?, 'yes', 'buy', 1, 97, 0, -0.97)", (TICKER,))
+    conn.rollback()     # e.g. a later cash/position write failed
+    assert _counts(conn) == (0, 0)
+    assert rows(conn, "SELECT COUNT(*) FROM paper_fills")[0][0] == 0
+
+
+def test_exception_after_apply_in_get_db_rolls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("KRYPT_TRADER_USERDATA", str(tmp_path))
+    db.init_db()
+    with pytest.raises(RuntimeError):
+        with db.get_db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            apply(c, auto_begin=False)
+            raise RuntimeError("position write failed")
+    with db.get_db() as c:
+        assert c.execute("SELECT COUNT(*) FROM fee_fill_model").fetchone()[0] == 0
+        assert c.execute("SELECT COUNT(*) FROM fee_order_state").fetchone()[0] == 0
+
+
+def test_successful_caller_transaction_commits(tmp_path, monkeypatch):
+    monkeypatch.setenv("KRYPT_TRADER_USERDATA", str(tmp_path))
+    db.init_db()
+    with db.get_db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        apply(c, auto_begin=False)
+    with db.get_db() as c:
+        assert c.execute("SELECT COUNT(*) FROM fee_fill_model").fetchone()[0] == 1
+
+
+def test_evidence_refs_namespaced_by_env_and_account(conn):
+    # Codex repro: paper and production refs to the same capture used to collapse.
+    for env in ("paper", "production"):
+        fl.add_evidence_ref(conn, evidence_ref="cap1", kalshi_env=env,
+                            referrer_kind="fill", referrer_id="f1", account_id="acct-a")
+    fl.add_evidence_ref(conn, evidence_ref="cap1", kalshi_env="paper",
+                        referrer_kind="fill", referrer_id="f1", account_id="acct-b")
+    fl.add_evidence_ref(conn, evidence_ref="cap1", kalshi_env="paper",
+                        referrer_kind="forecast", referrer_id="f1")
+    fl.add_evidence_ref(conn, evidence_ref="cap1", kalshi_env="paper",   # exact duplicate
+                        referrer_kind="fill", referrer_id="f1", account_id="acct-a")
+    got = sorted(rows(conn, "SELECT kalshi_env, account_id, referrer_kind FROM fee_evidence_refs"))
+    assert got == [("paper", "", "forecast"), ("paper", "acct-a", "fill"),
+                   ("paper", "acct-b", "fill"), ("production", "acct-a", "fill")]
+
+
+@pytest.mark.parametrize("kind,acct", [("fill", None), ("order", ""), ("trade", "a/b"),
+                                       ("forecast", "acct-a"), ("evaluation", "x")])
+def test_evidence_ref_account_scope_enforced(conn, kind, acct):
+    with pytest.raises(fl.FeeLedgerError):
+        fl.add_evidence_ref(conn, evidence_ref="cap1", kalshi_env="paper",
+                            referrer_kind=kind, referrer_id="r1", account_id=acct)
+
+
+def test_evidence_ref_scope_check_constraint(conn):
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO fee_evidence_refs VALUES ('c','paper','','fill','f1','t')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO fee_evidence_refs VALUES ('c','paper','acct','forecast','f1','t')")

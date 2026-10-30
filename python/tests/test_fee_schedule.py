@@ -820,3 +820,9 @@ def test_early_unavailable_returns_keep_assumptions_and_coverage(make):
     assert r.assumptions == ("s-a",)
     assert set(r.provenance["coverage"]) == {"series_changes", "event_changes"}
     assert r.provenance["coverage"]["series_changes"]["assumption_ids"] == ("s-a",)
+
+
+def test_every_resolution_carries_its_market_ticker():
+    for r in (resolve(), resolve(sc=series_changes(cov=fs.Coverage.none())),
+              resolve(at=AS_OF.hi + TTL + timedelta(seconds=1))):
+        assert r.market_ticker == "KXBTC15M-26OCT300700-00"
