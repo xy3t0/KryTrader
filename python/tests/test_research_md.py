@@ -23,7 +23,8 @@ TK = "KXBTC15M-X-00"
 class FakeWS:
     """One orderbook subscription with a seq shared by all its markets."""
 
-    def __init__(self, answer_pings=True):
+    def __init__(self, answer_pings=True, pong_delay=0.0):
+        self.pong_delay = pong_delay
         self.sent = []
         self.inbox = asyncio.Queue()
         self.answer_pings = answer_pings
@@ -62,8 +63,11 @@ class FakeWS:
         return item
 
     async def ping(self):
-        f = asyncio.get_running_loop().create_future()
-        if self.answer_pings:
+        loop = asyncio.get_running_loop()
+        f = loop.create_future()
+        if self.answer_pings and self.pong_delay:
+            loop.call_later(self.pong_delay, lambda: f.done() or f.set_result(None))
+        elif self.answer_pings:
             f.set_result(None)
         return f
 
@@ -81,7 +85,8 @@ def client(sockets, events, cf=None, **kw):
     it = iter(sockets)
     c = md.MarketDataClient(on_event=events.append, on_cf=cf, headers=lambda: {"h": "signed"},
                             connect=lambda url, headers: next(it), clock=Clock(),
-                            ping_every_s=0.01, pong_timeout_s=0.05, backoff_base_s=0.01, **kw)
+                            ping_every_s=0.01, pong_timeout_s=0.05, dead_after_s=0.1,
+                            backoff_base_s=0.01, **kw)
     return c
 
 
@@ -116,6 +121,17 @@ def test_unanswered_ping_drops_connection_and_reconnects():
     gens = [(e["kind"], e["gen"]) for e in events if e["kind"] in ("up", "down")]
     g = gens[0][1]
     assert gens[:3] == [("up", g), ("down", g), ("up", g + 1)]
+
+
+def test_slow_pong_is_not_liveness_and_does_not_reconnect():
+    events = []
+    ws = FakeWS(pong_delay=0.07)          # slower than pong_timeout, faster than dead_after
+    c = client([ws], events)
+    c.set_markets([TK])
+    asyncio.run(run_for(c, 0.4))
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("up") == 1 and "alive" not in kinds
+    assert c.pong_stats["slow"] >= 1 and c.pong_stats["fast"] == 0
 
 
 def test_recv_error_reconnects_with_new_generation():

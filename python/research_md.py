@@ -56,12 +56,18 @@ class MarketDataClient:
                  connect: Optional[Callable[..., Any]] = None,
                  url: str = WS_URL, clock: Callable[[], datetime] = _server_now,
                  ping_every_s: float = 1.0, pong_timeout_s: float = 2.0,
-                 backoff_base_s: float = 1.0,
+                 dead_after_s: float = 15.0, backoff_base_s: float = 1.0,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep):
         self.on_event, self.on_cf = on_event, on_cf
         self.headers, self.url, self.clock = headers, url, clock
         self._connect = connect
         self.ping_every_s, self.pong_timeout_s, self.sleep = ping_every_s, pong_timeout_s, sleep
+        # A pong slower than pong_timeout_s is NOT liveness evidence (no 'alive'
+        # mark), but the link is only declared dead after dead_after_s: home
+        # connections have pong hiccups, and reconnecting on each one churned
+        # the subscription. Evidence semantics are unchanged.
+        self.dead_after_s = max(dead_after_s, pong_timeout_s)
+        self.pong_stats = {"fast": 0, "slow": 0, "max_rtt_ms": 0}
         self.backoff_base_s = backoff_base_s
         # Unique across process restarts, so recorded generations never collide.
         self.generation = int(time.time() * 1000)
@@ -180,9 +186,16 @@ class MarketDataClient:
     async def _pinger(self, ws) -> None:
         while True:
             await self.sleep(self.ping_every_s)
+            sent = time.monotonic()
             waiter = await ws.ping()
-            await asyncio.wait_for(waiter, timeout=self.pong_timeout_s)
-            self._emit("alive")
+            await asyncio.wait_for(waiter, timeout=self.dead_after_s)
+            rtt = time.monotonic() - sent
+            self.pong_stats["max_rtt_ms"] = max(self.pong_stats["max_rtt_ms"], int(rtt * 1000))
+            if rtt <= self.pong_timeout_s:
+                self.pong_stats["fast"] += 1
+                self._emit("alive")
+            else:
+                self.pong_stats["slow"] += 1
 
     async def _session(self) -> None:
         connect = self._connect

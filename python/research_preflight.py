@@ -93,8 +93,8 @@ async def run_preflight() -> Report:
 
     r = Report()
     print(f"App data: {os.environ['KRYPT_TRADER_USERDATA']}", flush=True)
-    if not r.add("Kalshi API key saved", kalshi_auth.credentials_present(kalshi_auth.PRODUCTION),
-                 "add it in the app: API Keys"):
+    have_key = kalshi_auth.credentials_present(kalshi_auth.PRODUCTION)
+    if not r.add("Kalshi API key saved", have_key, "" if have_key else "add it in the app: API Keys"):
         return r
     try:
         offset = kalshi_auth.sync_server_time(force=True)
@@ -139,7 +139,7 @@ async def run_preflight() -> Report:
         orig_send = md._send
 
         async def recording_send(obj):
-            sent.append(obj)
+            sent.append((md.generation, obj))
             await orig_send(obj)
         md._send = recording_send
         md.set_markets([market])
@@ -151,14 +151,26 @@ async def run_preflight() -> Report:
             if ok:
                 usable = await _wait(lambda: stream.state_at(market, now()) is not None, 25)
                 r.add("Snapshot received and book usable (with liveness)", usable)
-                subs = [s for s in sent if s["cmd"] == "subscribe"
-                        and s["params"].get("channels") == ["orderbook_delta"]]
-                r.add("Exactly one orderbook subscription", len(subs) == 1, f"{len(subs)} sent")
+                # One subscription per CONNECTION (a reconnect re-subscribes).
+                per_conn: dict = {}
+                for g, s in sent:
+                    if s["cmd"] == "subscribe" and s["params"].get("channels") == ["orderbook_delta"]:
+                        per_conn[g] = per_conn.get(g, 0) + 1
+                r.add("Exactly one orderbook subscription per connection",
+                      bool(per_conn) and all(n == 1 for n in per_conn.values()),
+                      f"{sum(per_conn.values())} over {len(per_conn)} connection(s)")
 
-                before = snapshots["n"]
-                asked = await md.request_snapshot([market])
-                got = asked and await _wait(lambda: snapshots["n"] > before, 15)
-                r.add("get_snapshot answered", bool(got))
+                got = False
+                for _ in range(3):      # a drop mid-request is retried, not a failure
+                    if not await _wait(lambda: md.connected and md._sid is not None
+                                       and market in md._have, 20):
+                        continue
+                    before = snapshots["n"]
+                    if await md.request_snapshot([market]) and \
+                            await _wait(lambda: snapshots["n"] > before, 10):
+                        got = True
+                        break
+                r.add("get_snapshot answered", got)
 
                 gen = md.generation
                 if md._ws is not None:
@@ -167,14 +179,21 @@ async def run_preflight() -> Report:
                                     and stream.state_at(market, now()) is not None, 60)
                 r.add("Reconnect: new generation and usable book again", again,
                       f"generation {gen} -> {md.generation}")
-                cmds = {s["cmd"] for s in sent}
-                actions = {s["params"].get("action") for s in sent if s["cmd"] == "update_subscription"}
+                cmds = {s["cmd"] for _, s in sent}
+                actions = {s["params"].get("action") for _, s in sent if s["cmd"] == "update_subscription"}
                 r.add("Only read-only commands were sent",
                       cmds <= research_md.ALLOWED_CMDS and actions <= research_md.ALLOWED_ACTIONS,
                       f"commands {sorted(cmds)}")
                 cf_ok = await _wait(lambda: rx.PARAMS["asset"] in cf_state.values, 10)
                 r.add("CF index frames on the research socket", cf_ok,
                       "optional: Coinbase proxy is used otherwise", required=False)
+                ps = md.pong_stats
+                total = ps["fast"] + ps["slow"]
+                r.add("Connection quality (pings answered within 2 s)",
+                      total > 0 and ps["slow"] <= total // 10,
+                      f"{ps['fast']}/{total} fast, slowest {ps['max_rtt_ms']} ms, "
+                      f"{len(per_conn)} connection(s); slow pings only cost coverage",
+                      required=False)
         finally:
             stop.set()
             try:
