@@ -32,6 +32,12 @@ TTL = timedelta(minutes=5)
 AT = T0 + timedelta(seconds=30)                      # after the snapshot window
 
 
+# SYNTHETIC: no live coverage is VERIFIED today. Most tests isolate other
+# behaviour by granting full coverage; coverage itself is tested below.
+FULL = fs.Coverage(fs.VERIFIED, start=T0 - timedelta(days=400), end=T0 + timedelta(days=1),
+                   scope=frozenset({fs.ALL_TICKERS}), evidence=("synthetic-test-coverage",))
+
+
 def J(text: str):
     return fs.loads(text)
 
@@ -56,8 +62,8 @@ def series(text=OBS_SERIES_BTC15M, as_of=AS_OF):
     return fs.parse_series(J(text), as_of)
 
 
-def series_changes(text=OBS_SERIES_CHANGES_DEFAULT, *, hist=True, as_of=AS_OF):
-    return fs.parse_series_fee_changes(J(text), as_of, include_historical=hist)
+def series_changes(text=OBS_SERIES_CHANGES_DEFAULT, *, hist=True, as_of=AS_OF, cov=FULL):
+    return fs.parse_series_fee_changes(J(text), as_of, include_historical=hist, coverage=cov)
 
 
 def event(event_ticker, series_ticker, extra="", as_of=AS_OF):
@@ -65,9 +71,9 @@ def event(event_ticker, series_ticker, extra="", as_of=AS_OF):
     return fs.parse_event(J('{"event":{' + body + '}}'), as_of)
 
 
-def event_changes(*pages, as_of=AS_OF):
+def event_changes(*pages, as_of=AS_OF, cov=FULL):
     pages = pages or (OBS_EVENT_CHANGES_EMPTY,)
-    return fs.parse_event_fee_change_pages([J(p) for p in pages], as_of)
+    return fs.parse_event_fee_change_pages([J(p) for p in pages], as_of, coverage=cov)
 
 
 def market(ticker, event_ticker, as_of=AS_OF, **extra):
@@ -178,7 +184,7 @@ def test_series_missing_or_malformed_fields(text):
 def test_unsupported_fee_types(ftype):  # SYNTHETIC: none observed live
     s = series('{"series":{"ticker":"KXBTC15M","fee_type":"' + ftype + '","fee_multiplier":1}}')
     r = resolve(s=s)
-    assert r.status == UNSUPPORTED and r.coefficient is None and not r.usable
+    assert r.status == UNSUPPORTED and r.coefficient is None and not r.has_coefficient
 
 
 def test_maker_fee_type_coefficients():  # SYNTHETIC multiplier 0.5 (0.5 was an observed spelling)
@@ -337,7 +343,7 @@ def test_active_waiver_is_unresolved_not_zero():
     m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700",
                fee_waiver_expiration_time=_iso(exp))
     r = resolve(m=m)
-    assert r.status == WAIVER_UNRESOLVED and r.coefficient is None and not r.usable
+    assert r.status == WAIVER_UNRESOLVED and r.coefficient is None and not r.has_coefficient
     assert m.waiver_field == "set"
 
 
@@ -442,15 +448,21 @@ def test_raw_fixture_hashes_match_capture_manifest(name):
     assert hashlib.sha256((RAW / name).read_bytes()).hexdigest() == m["sha256"]
 
 
+# SYNTHETIC coverage over the raw capture (no live coverage claim exists).
+RAW_COV = fs.Coverage(fs.ASSUMED, start=datetime(2025, 1, 1, tzinfo=UTC),
+                      end=datetime(2026, 10, 31, tzinfo=UTC), scope=frozenset({fs.ALL_TICKERS}),
+                      evidence=("capture-2026-10-30",), assumption_ids=("synthetic-test-assumption",))
+
+
 def _raw_btc15m(role):
     ev_payload = _raw("event-btc15m.json")
     s = fs.parse_series(_raw("series-btc15m.json"), _raw_as_of("series-btc15m.json"))
     sc = fs.parse_series_fee_changes(_raw("series-fee-changes-historical.json"),
                                      _raw_as_of("series-fee-changes-historical.json"),
-                                     include_historical=True)
+                                     include_historical=True, coverage=RAW_COV)
     e = fs.parse_event(ev_payload, _raw_as_of("event-btc15m.json"))
     ec = fs.parse_event_fee_change_pages([_raw("event-fee-changes.json")],
-                                         _raw_as_of("event-fee-changes.json"))
+                                         _raw_as_of("event-fee-changes.json"), coverage=RAW_COV)
     m = fs.parse_market(_raw("markets-btc15m.json")["markets"][0], _raw_as_of("markets-btc15m.json"))
     at = max(x.as_of.hi for x in (s, sc, e, ec, m)) + timedelta(seconds=1)
     return fs.resolve_fee_schedule(market=m, series=s, series_changes=sc, event=e,
@@ -484,7 +496,7 @@ def test_raw_combo_series_parse():
 def test_raw_historical_series_changes_all_parse():
     sc = fs.parse_series_fee_changes(_raw("series-fee-changes-historical.json"),
                                      _raw_as_of("series-fee-changes-historical.json"),
-                                     include_historical=True)
+                                     include_historical=True, coverage=RAW_COV)
     assert len(sc.changes) == 107
     assert all(c.fee_type in fs.KNOWN_FEE_TYPES for c in sc.changes)
     assert min(c.scheduled for c in sc.changes) == datetime(2025, 10, 4, 7, 0, tzinfo=UTC)
@@ -493,7 +505,7 @@ def test_raw_historical_series_changes_all_parse():
 def test_raw_default_series_changes_empty():
     sc = fs.parse_series_fee_changes(_raw("series-fee-changes.json"),
                                      _raw_as_of("series-fee-changes.json"),
-                                     include_historical=False)
+                                     include_historical=False, coverage=fs.Coverage.none())
     assert sc.changes == ()
 
 
@@ -568,12 +580,12 @@ def test_malformed_payloads_raise_only_fee_metadata_error(inner):
         lambda: fs.parse_market(inner, AS_OF),
         *([] if inner == [] else [   # [] is a valid empty change list
             lambda: fs.parse_series_fee_changes({"series_fee_change_arr": inner}, AS_OF,
-                                                include_historical=True)]),
+                                                include_historical=True, coverage=FULL)]),
         lambda: fs.parse_series_fee_changes({"series_fee_change_arr": [inner]}, AS_OF,
-                                            include_historical=True),
-        lambda: fs.parse_event_fee_change_pages([inner], AS_OF),
+                                            include_historical=True, coverage=FULL),
+        lambda: fs.parse_event_fee_change_pages([inner], AS_OF, coverage=FULL),
         lambda: fs.parse_event_fee_change_pages(
-            [{"cursor": "", "event_fee_changes": [inner]}], AS_OF),
+            [{"cursor": "", "event_fee_changes": [inner]}], AS_OF, coverage=FULL),
     ]
     for call in calls:
         with pytest.raises(FeeMetadataError):
@@ -587,3 +599,148 @@ def test_loads_errors_are_fee_metadata_errors(text):
         fs.loads(text)
     if isinstance(text, (str, bytes)) and text not in ('{"a": -Infinity}',):
         assert exc.value.__cause__ is not None
+
+
+# ---- change-history coverage (all SYNTHETIC) -------------------------------
+
+def _cov(level=fs.ASSUMED, start=None, end=None, scope=(fs.ALL_TICKERS,), ids=("a1",)):
+    return fs.Coverage(level, start=start or T0 - timedelta(hours=1),
+                       end=end or T0 + timedelta(hours=1), scope=frozenset(scope),
+                       evidence=("cap-1",), assumption_ids=ids if level == fs.ASSUMED else ())
+
+
+@pytest.mark.parametrize("which", ["series", "event"])
+def test_missing_coverage_is_unavailable(which):
+    none = fs.Coverage.none()
+    kw = {"sc": series_changes(cov=none)} if which == "series" else {"ec": event_changes(cov=none)}
+    r = resolve(**kw)
+    assert (r.status, r.reason) == (UNAVAILABLE, f"history_unverified:{which}_changes")
+    assert r.coefficient is None
+
+
+def test_coverage_scope_must_include_ticker():
+    r = resolve(sc=series_changes(cov=_cov(scope=("KXETH15M",))))
+    assert r.reason == "history_unverified:series_changes"
+    r = resolve(sc=series_changes(cov=_cov(scope=("KXBTC15M",))))
+    assert r.status == RESOLVED
+
+
+def test_coverage_must_start_before_snapshot_lo():
+    # start is exclusive: a change exactly at lo would be uncovered.
+    r = resolve(ec=event_changes(cov=_cov(start=AS_OF.lo)))
+    assert r.reason == "history_unverified:event_changes"
+    r = resolve(ec=event_changes(cov=_cov(start=AS_OF.lo - timedelta(microseconds=1))))
+    assert r.status == RESOLVED
+
+
+def test_at_inside_window_still_needs_coverage_through_hi():
+    # `at` is before hi, but the snapshot may reflect changes up to hi.
+    at = AS_OF.hi - timedelta(seconds=5)
+    r = resolve(ec=event_changes(cov=_cov(end=at)), at=at)
+    assert r.reason == "history_unverified:event_changes"
+    r = resolve(ec=event_changes(cov=_cov(end=AS_OF.hi)), at=at)
+    assert r.status == RESOLVED
+
+
+def test_coverage_expiry_ends_resolution_and_bounds_validity():
+    end = AT + timedelta(seconds=10)
+    r = resolve(sc=series_changes(cov=_cov(end=end)))
+    assert r.status == RESOLVED and r.valid_until == end
+    r = resolve(sc=series_changes(cov=_cov(end=end)), at=end + timedelta(seconds=1))
+    assert r.reason == "history_unverified:series_changes"
+
+
+def test_assumptions_propagate_and_gate_admission():
+    r = resolve(sc=series_changes(cov=_cov(ids=("s-a",))), ec=event_changes(cov=_cov(ids=("e-a", "e-b"))))
+    assert r.status == RESOLVED and r.has_coefficient and not r.verified
+    assert r.assumptions == ("e-a", "e-b", "s-a")
+    assert not fs.admissible(r, {"s-a", "e-a"})          # every assumption must be accepted
+    assert fs.admissible(r, {"s-a", "e-a", "e-b", "unrelated"})
+    assert r.provenance["coverage"]["event_changes"]["assumption_ids"] == ("e-a", "e-b")
+
+
+def test_verified_result_needs_no_acceptance():
+    r = resolve()
+    assert r.verified and r.assumptions == () and fs.admissible(r, ())
+
+
+def test_unavailable_and_waiver_never_admissible():
+    assert not fs.admissible(resolve(sc=series_changes(cov=fs.Coverage.none())), {"anything"})
+    exp = T0 + timedelta(hours=1)
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700",
+               fee_waiver_expiration_time=_iso(exp))
+    assert not fs.admissible(resolve(m=m), ())
+
+
+def test_amended_change_follows_current_listing_within_coverage():
+    # Original: M=2 at +60s. Amended listing replaces it: M=3 at +20s.
+    amended = _ev_change("ec-amended", _iso(T0 + timedelta(seconds=20)), m="3")
+    r = resolve(ec=event_changes('{"cursor":"","event_fee_changes":[' + amended + ']}'),
+                at=T0 + timedelta(seconds=30))
+    assert r.multiplier == 3 and r.applied_change_ids == ("ec-amended",)
+
+
+def test_amendment_beyond_coverage_cannot_be_trusted():
+    # Coverage from an earlier listing ends before an amended change could
+    # land; resolving past that end is refused rather than trusting the gap.
+    cov_end = T0 + timedelta(seconds=25)
+    r = resolve(ec=event_changes(cov=_cov(end=cov_end)), at=T0 + timedelta(seconds=40))
+    assert r.reason == "history_unverified:event_changes"
+
+
+def test_lead_time_coverage_interval_and_assumptions():
+    listing = AsOf(T0, T0 + timedelta(seconds=5))
+    c = fs.lead_time_coverage(listing=listing, lead_time=timedelta(minutes=10),
+                              scope={"KXBTC15M-26OCT300700"}, evidence=["cap-9"])
+    assert (c.level, c.start, c.end) == (fs.ASSUMED, listing.hi, listing.lo + timedelta(minutes=10))
+    for a in fs.LEAD_TIME_ASSUMPTIONS:
+        assert a in c.assumption_ids
+    assert "fee-change-min-lead-time:600s" in c.assumption_ids
+
+
+@pytest.mark.parametrize("lead", [timedelta(0), timedelta(seconds=-1), timedelta(seconds=3), 600])
+def test_lead_time_coverage_rejects_bad_lead(lead):
+    with pytest.raises(FeeMetadataError):
+        fs.lead_time_coverage(listing=AsOf(T0, T0 + timedelta(seconds=5)), lead_time=lead,
+                              scope={"X"}, evidence=["cap"])
+
+
+def test_lead_time_coverage_alone_cannot_cover_the_past():
+    # A pending listing fetched at T0 covers only (hi, lo+L]; a snapshot window
+    # starting before the listing is not covered.
+    listing = AsOf(T0, T0 + timedelta(seconds=5))
+    c = fs.lead_time_coverage(listing=listing, lead_time=timedelta(minutes=10),
+                              scope={fs.ALL_TICKERS}, evidence=["cap"])
+    r = resolve(ec=event_changes(cov=c), at=T0 + timedelta(seconds=30))
+    assert r.reason == "history_unverified:event_changes"   # AS_OF.lo < listing.hi
+    snap = AsOf(T0 + timedelta(seconds=10), T0 + timedelta(seconds=12))
+    e = event("KXBTC15M-26OCT300700", "KXBTC15M", as_of=snap)
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700", as_of=snap)
+    r = resolve(e=e, m=m, ec=event_changes(cov=c), at=T0 + timedelta(seconds=30))
+    assert r.status == RESOLVED and set(fs.LEAD_TIME_ASSUMPTIONS) <= set(r.assumptions)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(level="MAYBE", start=T0, end=T0 + timedelta(1), scope={"*"}, evidence=("e",)),
+    dict(level=fs.ASSUMED, start=T0, end=T0, scope={"*"}, evidence=("e",), assumption_ids=("a",)),
+    dict(level=fs.ASSUMED, start=T0, end=T0 + timedelta(1), scope=set(), evidence=("e",),
+         assumption_ids=("a",)),
+    dict(level=fs.ASSUMED, start=T0, end=T0 + timedelta(1), scope={"*"}, evidence=(),
+         assumption_ids=("a",)),
+    dict(level=fs.ASSUMED, start=T0, end=T0 + timedelta(1), scope={"*"}, evidence=("e",)),
+    dict(level=fs.VERIFIED, start=T0, end=T0 + timedelta(1), scope={"*"}, evidence=("e",),
+         assumption_ids=("a",)),
+    dict(level=fs.NONE, start=T0),
+    dict(level=fs.VERIFIED, start=datetime(2026, 1, 1), end=T0, scope={"*"}, evidence=("e",)),
+])
+def test_coverage_validation(kw):
+    with pytest.raises(FeeMetadataError):
+        fs.Coverage(**kw)
+
+
+def test_parsers_require_explicit_coverage():
+    with pytest.raises(FeeMetadataError):
+        fs.parse_series_fee_changes(J(OBS_SERIES_CHANGES_DEFAULT), AS_OF,
+                                    include_historical=True, coverage=None)
+    with pytest.raises(TypeError):
+        fs.parse_event_fee_change_pages([J(OBS_EVENT_CHANGES_EMPTY)], AS_OF)

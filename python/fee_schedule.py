@@ -40,6 +40,15 @@ coefficient:
   WAIVER_UNRESOLVED  a fee waiver may be in force at `at`; its scope is not
                      documented, so actual fees are unknown
 
+Change-history coverage. Each change listing carries an explicit Coverage
+claim (VERIFIED / ASSUMED with named assumptions / NONE) over an interval
+and ticker scope. A result needs coverage of [lo, max(at, hi)] for every
+listing it depends on, else UNAVAILABLE(history_unverified:...). Results
+built on ASSUMED coverage list those assumptions; money paths must gate on
+admissible(result, accepted_assumptions), never on has_coefficient.
+Exchange-reported fill fees (Get Fills fee_cost) remain the accounting
+evidence for fills that happened; this resolver does not replace them.
+
 Historical resolution before a snapshot is UNAVAILABLE here. An exploratory
 backtest estimate, if added, must be a separate, distinctly typed result.
 """
@@ -211,6 +220,105 @@ class AsOf:
         )
 
 
+# ---- change-history coverage --------------------------------------------
+
+VERIFIED = "VERIFIED"
+ASSUMED = "ASSUMED"
+NONE = "NONE"
+ALL_TICKERS = "*"
+
+# The conditions under which a pending-change listing covers future changes.
+# A change being published once, early enough, establishes none of the others.
+LEAD_TIME_ASSUMPTIONS = (
+    "fee-change-continuously-visible-until-effective",
+    "fee-change-amendments-obey-notice",
+    "fee-change-pagination-complete",
+)
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """Which scheduled changes a change listing is known to contain.
+
+    Covers changes for `scope` tickers with scheduled_ts in (start, end].
+    VERIFIED: established without assumptions. ASSUMED: holds only if every
+    listed assumption holds; admission must accept each one explicitly.
+    NONE: no coverage claim. `evidence` references the captures it rests on.
+    Pagination completeness alone is not coverage."""
+    level: str
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+    scope: frozenset = frozenset()
+    evidence: tuple[str, ...] = ()
+    assumption_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.level == NONE:
+            if self.start or self.end or self.scope or self.assumption_ids:
+                raise FeeMetadataError("NONE coverage carries no interval, scope or assumptions")
+            return
+        if self.level not in (VERIFIED, ASSUMED):
+            raise FeeMetadataError(f"coverage level must be VERIFIED/ASSUMED/NONE, got {self.level!r}")
+        object.__setattr__(self, "start", _aware(self.start, "Coverage.start"))
+        object.__setattr__(self, "end", _aware(self.end, "Coverage.end"))
+        if not self.start < self.end:
+            raise FeeMetadataError("Coverage.start must be before Coverage.end")
+        scope = frozenset(self.scope)
+        if not scope or not all(isinstance(t, str) and t for t in scope):
+            raise FeeMetadataError("Coverage.scope must be a nonempty set of tickers (or '*')")
+        object.__setattr__(self, "scope", scope)
+        ev = tuple(self.evidence)
+        if not ev or not all(isinstance(e, str) and e for e in ev):
+            raise FeeMetadataError("Coverage needs at least one evidence reference")
+        object.__setattr__(self, "evidence", ev)
+        ids = tuple(sorted(set(self.assumption_ids)))
+        if not all(isinstance(a, str) and a for a in ids):
+            raise FeeMetadataError("assumption ids must be nonempty strings")
+        if self.level == VERIFIED and ids:
+            raise FeeMetadataError("VERIFIED coverage cannot rest on assumptions")
+        if self.level == ASSUMED and not ids:
+            raise FeeMetadataError("ASSUMED coverage must name its assumptions")
+        object.__setattr__(self, "assumption_ids", ids)
+
+    @classmethod
+    def none(cls) -> "Coverage":
+        return cls(NONE)
+
+    def covers(self, ticker: str, start: datetime, end: datetime) -> bool:
+        """True if every change for `ticker` scheduled in [start, end] is covered."""
+        if self.level == NONE:
+            return False
+        if ALL_TICKERS not in self.scope and ticker not in self.scope:
+            return False
+        return self.start < start and end <= self.end
+
+    def provenance(self) -> dict:
+        return {"level": self.level, "start": self.start, "end": self.end,
+                "scope": sorted(self.scope), "evidence": self.evidence,
+                "assumption_ids": self.assumption_ids}
+
+
+def lead_time_coverage(*, listing: AsOf, lead_time: timedelta, scope: Iterable[str],
+                       evidence: Iterable[str]) -> Coverage:
+    """ASSUMED coverage from a pending-change listing under a minimum
+    announcement lead time L: changes scheduled in (listing.hi, listing.lo + L].
+    L has no default and no documented source yet; the lead-time value is
+    itself recorded as an assumption, alongside LEAD_TIME_ASSUMPTIONS."""
+    if not isinstance(listing, AsOf):
+        raise FeeMetadataError("listing must be an AsOf")
+    if not isinstance(lead_time, timedelta) or lead_time <= timedelta(0):
+        raise FeeMetadataError("lead_time must be a positive timedelta")
+    end = listing.lo + lead_time
+    if end <= listing.hi:
+        raise FeeMetadataError("lead_time shorter than the listing's own uncertainty window")
+    return Coverage(
+        level=ASSUMED, start=listing.hi, end=end, scope=frozenset(scope),
+        evidence=tuple(evidence),
+        assumption_ids=LEAD_TIME_ASSUMPTIONS
+        + (f"fee-change-min-lead-time:{int(lead_time.total_seconds())}s",),
+    )
+
+
 # ---- parsed inputs --------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -236,6 +344,7 @@ class SeriesChangeList:
     changes: tuple[SeriesFeeChange, ...]
     include_historical: bool
     as_of: AsOf
+    coverage: Coverage
 
 
 @dataclass(frozen=True)
@@ -263,6 +372,7 @@ class EventFeeChange:
 class EventChangeList:
     changes: tuple[EventFeeChange, ...]
     as_of: AsOf
+    coverage: Coverage
 
 
 @dataclass(frozen=True)
@@ -290,12 +400,22 @@ def parse_series(payload: dict, as_of: AsOf) -> SeriesSnapshot:
     )
 
 
+def _check_coverage(coverage: Any) -> Coverage:
+    if not isinstance(coverage, Coverage):
+        raise FeeMetadataError("coverage must be a Coverage (use Coverage.none() for no claim)")
+    return coverage
+
+
 def parse_series_fee_changes(payload: dict, as_of: AsOf, *,
-                             include_historical: bool) -> SeriesChangeList:
+                             include_historical: bool,
+                             coverage: Coverage) -> SeriesChangeList:
     """`include_historical` must reflect the request actually sent
-    (show_historical=true). The default list holds only pending changes."""
+    (show_historical=true). The default list holds only pending changes.
+    `coverage` is the caller's explicit claim about what the listing holds;
+    show_historical=true alone does not establish it."""
     if not isinstance(include_historical, bool):
         raise FeeMetadataError("include_historical must be a bool")
+    _check_coverage(coverage)
     arr = _require(payload, "series_fee_change_arr", "series fee changes response")
     if not isinstance(arr, list):
         raise FeeMetadataError("series_fee_change_arr must be a list")
@@ -309,7 +429,7 @@ def parse_series_fee_changes(payload: dict, as_of: AsOf, *,
             multiplier=_multiplier(_require(c, "fee_multiplier", ctx), f"{ctx}.fee_multiplier"),
             scheduled=parse_ts(_require(c, "scheduled_ts", ctx), f"{ctx}.scheduled_ts"),
         ))
-    return SeriesChangeList(tuple(out), include_historical, as_of)
+    return SeriesChangeList(tuple(out), include_historical, as_of, coverage)
 
 
 def _optional_override(obj: dict, key: str, parse: Callable[[Any, str], Any],
@@ -335,9 +455,12 @@ def parse_event(payload: dict, as_of: AsOf) -> EventSnapshot:
     )
 
 
-def parse_event_fee_change_pages(pages: Sequence[dict], as_of: AsOf) -> EventChangeList:
+def parse_event_fee_change_pages(pages: Sequence[dict], as_of: AsOf, *,
+                                 coverage: Coverage) -> EventChangeList:
     """All pages of one listing, in order. The final page's cursor must be
-    empty; a partial listing is refused rather than read as 'no changes'."""
+    empty; a partial listing is refused rather than read as 'no changes'.
+    A complete listing is still not coverage: `coverage` states that claim."""
+    _check_coverage(coverage)
     if not isinstance(pages, (list, tuple)) or not pages:
         raise FeeMetadataError("event fee change pages: need at least one page")
     out = []
@@ -365,7 +488,7 @@ def parse_event_fee_change_pages(pages: Sequence[dict], as_of: AsOf) -> EventCha
                 multiplier_override=None if m is None else _multiplier(m, f"{ctx}.fee_multiplier_override"),
                 scheduled=parse_ts(_require(c, "scheduled_ts", ctx), f"{ctx}.scheduled_ts"),
             ))
-    return EventChangeList(tuple(out), as_of)
+    return EventChangeList(tuple(out), as_of, coverage)
 
 
 def parse_market(market: dict, as_of: AsOf) -> MarketFeeInfo:
@@ -398,11 +521,27 @@ class FeeResolution:
     coefficient: Optional[Decimal] = None  # only for RESOLVED / EXPLICIT_ZERO
     valid_until: Optional[datetime] = None
     applied_change_ids: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()  # every assumption this result rests on
     provenance: dict = field(default_factory=dict)
 
     @property
-    def usable(self) -> bool:
+    def has_coefficient(self) -> bool:
         return self.status in (RESOLVED, EXPLICIT_ZERO)
+
+    @property
+    def verified(self) -> bool:
+        """A coefficient that rests on no assumptions."""
+        return self.has_coefficient and not self.assumptions
+
+
+def admissible(result: FeeResolution, accepted_assumptions: Iterable[str]) -> bool:
+    """The only gate a money path may use: a coefficient exists AND the
+    policy explicitly accepts every assumption it rests on. Analysis may read
+    has_coefficient; admission must not."""
+    if not isinstance(result, FeeResolution):
+        raise FeeMetadataError("admissible() needs a FeeResolution")
+    accepted = set(accepted_assumptions)
+    return result.has_coefficient and set(result.assumptions) <= accepted
 
 
 class _Unavailable(Exception):
@@ -511,8 +650,24 @@ def resolve_fee_schedule(
     if not series_changes.include_historical:
         return out(UNAVAILABLE, "change_history_required")
 
-    # Validity ends at the earliest snapshot expiry or known boundary after `at`.
+    prov["coverage"] = {"series_changes": series_changes.coverage.provenance(),
+                        "event_changes": event_changes.coverage.provenance()}
+    # A snapshot observed anywhere in [lo, hi] may already reflect a change
+    # scheduled up to hi, even when `at` is earlier: coverage must span
+    # [lo, max(at, hi)] for each change listing the result depends on.
+    for label, cov, ticker, snap in (
+        ("series_changes", series_changes.coverage, series.ticker, series.as_of),
+        ("event_changes", event_changes.coverage, event.event_ticker, event.as_of),
+    ):
+        if not cov.covers(ticker, snap.lo, max(at, snap.hi)):
+            return out(UNAVAILABLE, f"history_unverified:{label}")
+    assumptions = tuple(sorted(set(series_changes.coverage.assumption_ids)
+                               | set(event_changes.coverage.assumption_ids)))
+
+    # Validity ends at the earliest snapshot expiry, coverage expiry, or
+    # known boundary after `at`.
     bounds = [a.hi + ttl for a in inputs.values()]
+    bounds += [series_changes.coverage.end, event_changes.coverage.end]
     nb = _next_boundary([c.scheduled for c in s_changes] + [c.scheduled for c in e_changes], at)
     if nb is not None:
         bounds.append(nb)
@@ -521,7 +676,8 @@ def resolve_fee_schedule(
     valid_until = min(bounds)
 
     if market.waiver_expiry is not None and at < market.waiver_expiry:
-        return out(WAIVER_UNRESOLVED, "waiver_may_apply", valid_until=valid_until)
+        return out(WAIVER_UNRESOLVED, "waiver_may_apply", valid_until=valid_until,
+                   assumptions=assumptions)
 
     try:
         (s_type, s_mult), s_ids = _resolve_value(
@@ -540,7 +696,7 @@ def resolve_fee_schedule(
             at, "event_multiplier",
         )
     except _Unavailable as u:
-        return out(UNAVAILABLE, u.reason, valid_until=valid_until)
+        return out(UNAVAILABLE, u.reason, valid_until=valid_until, assumptions=assumptions)
 
     fee_type = e_type if e_type is not None else s_type
     mult = e_mult if e_mult is not None else s_mult
@@ -548,7 +704,7 @@ def resolve_fee_schedule(
     prov["type_source"] = "event" if e_type is not None else "series"
     prov["multiplier_source"] = "event" if e_mult is not None else "series"
     common = dict(fee_type=fee_type, multiplier=mult, valid_until=valid_until,
-                  applied_change_ids=applied)
+                  applied_change_ids=applied, assumptions=assumptions)
 
     if fee_type not in KNOWN_FEE_TYPES or fee_type == FEE_TYPE_FLAT:
         return out(UNSUPPORTED, f"fee_type:{fee_type}", **common)
