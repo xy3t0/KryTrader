@@ -676,9 +676,13 @@ class C15Runner:
             await self.decide_once()
 
     # -- decisions
+    def _identity(self) -> dict:
+        """This cohort's frozen fee identity (never the current globals)."""
+        return {"account_id": self.p["account_id"], "policy": self.p["fee_policy"]}
+
     async def decide_once(self) -> None:
         inp = await self.inputs()
-        if inp is None:
+        if inp is None or not self.accepting():
             return
         primary = self.p["primary_latency_s"]
         tape = self.tape_for(inp.market_ticker, inp.decided_at)
@@ -693,7 +697,12 @@ class C15Runner:
         if d.eligible:
             arrivals = {lat: inp.decided_at + timedelta(seconds=lat) for lat in self.p["latencies_s"]}
             prepared = await self.prepare_fees(market_ticker=inp.market_ticker,
-                                               decided_at=inp.decided_at, arrivals=arrivals)
+                                               decided_at=inp.decided_at, arrivals=arrivals,
+                                               **self._identity())
+        # Acceptance can change during the awaits above (disable, mode change,
+        # suspension, the 90-day deadline): re-check right before writing.
+        if not self.accepting():
+            return
         self._begin()
         try:
             did = self.conn.execute(
@@ -821,7 +830,7 @@ class C15Runner:
     def _execute(self, o: dict, from_state: str = "pending") -> None:
         arrival = _dt(o["arrival_at"])
         try:
-            ctx = self.rebuild_fee(json.loads(o["fee_evidence"]), arrival)
+            ctx = self.rebuild_fee(json.loads(o["fee_evidence"]), arrival, **self._identity())
         except Exception as e:
             ctx = fctx.FeeContext("paper", self.p["account_id"], None, Decimal(0), "",
                                   self.p["fee_policy"], None, (), None, False, f"rebuild_failed:{e}")
@@ -896,7 +905,8 @@ class C15Runner:
         for event, lat in rows:
             o = self._order(event, lat)
             try:
-                ctx = self.rebuild_fee(json.loads(o["fee_evidence"]), _dt(o["arrival_at"]))
+                ctx = self.rebuild_fee(json.loads(o["fee_evidence"]), _dt(o["arrival_at"]),
+                                       **self._identity())
             except Exception:
                 continue
             if ctx.usable:

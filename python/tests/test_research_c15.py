@@ -52,14 +52,15 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
-def fee_ctx(conn, at, *, market=MKT, mult="1", waiver=None):
+def fee_ctx(conn, at, *, market=MKT, mult="1", waiver=None, account=None, policy=None):
     J = fs.loads
     a = fs.AsOf(at - timedelta(seconds=5), at)
     mk = {"ticker": market, "event_ticker": EV}
     if waiver:
         mk["fee_waiver_expiration_time"] = waiver
     return fctx.build_fee_context(
-        conn, kalshi_env="paper", account_id=rx.PARAMS["account_id"], policy=fctx.CONDITIONAL_PAPER,
+        conn, kalshi_env="paper", account_id=account or "research-c15",
+        policy=policy or fctx.CONDITIONAL_PAPER,
         role="taker", at=at, ttl=timedelta(seconds=30), evidence=("cap-x",),
         market=fs.parse_market(mk, a),
         series=fs.parse_series(J('{"series":{"ticker":"KXBTC15M","fee_type":"quadratic",'
@@ -300,6 +301,7 @@ class Harness:
         self.fee_ok = True
         self.arrival_mult = "1"
         self.fail_admit_latency = None
+        self.identities = []
 
     async def inputs(self):
         return self.queue.pop(0) if self.queue else None
@@ -307,15 +309,19 @@ class Harness:
     def tape_for(self, ticker, at):
         return self.tape if ticker == MKT else None
 
-    async def prepare_fees(self, *, market_ticker, decided_at, arrivals):
-        later = {lat: fee_ctx(self.conn, a, market=market_ticker, mult=self.arrival_mult)
+    async def prepare_fees(self, *, market_ticker, decided_at, arrivals, account_id, policy):
+        self.identities.append((account_id, policy))
+        idn = dict(account=account_id, policy=policy)
+        later = {lat: fee_ctx(self.conn, a, market=market_ticker, mult=self.arrival_mult, **idn)
                  for lat, a in arrivals.items()}
-        return fee_ctx(self.conn, decided_at, market=market_ticker), later, {"captures": ["cap-x"]}
+        return (fee_ctx(self.conn, decided_at, market=market_ticker, **idn), later,
+                {"captures": ["cap-x"]})
 
-    def rebuild_fee(self, evidence, at):
+    def rebuild_fee(self, evidence, at, *, account_id, policy):
+        self.identities.append((account_id, policy))
         if not self.fee_ok:
             raise RuntimeError("capture store unavailable")
-        return fee_ctx(self.conn, at, mult=self.arrival_mult)
+        return fee_ctx(self.conn, at, mult=self.arrival_mult, account=account_id, policy=policy)
 
     async def result_for(self, ticker):
         return (self.result if self.clock() > CLOSE else None), ("settle-cap",)
@@ -827,3 +833,90 @@ def test_draining_uses_the_cohorts_own_frozen_params(conn):
     ha.at(10)
     asyncio.run(drain.tick())
     assert {k: v[0] for k, v in orders(conn).items()} == {1: "filled", 3: "filled"}
+
+
+
+# ---- acceptance re-checked after async work (review) ------------------------------------
+
+def _no_new_orders(conn, mid):
+    assert conn.execute("SELECT COUNT(*) FROM rx_orders").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM rx_attempts").fetchone()[0] == 0
+    assert wallet(conn, mid, 1).reserved == 0
+
+
+def test_disabled_during_input_collection_writes_nothing(conn):
+    mid = setup(conn)
+    h = Harness(conn, mid)
+    orig = h.inputs
+
+    async def inputs():
+        h.accepting = False                       # disabled / mode change / suspended meanwhile
+        return await orig()
+    h.inputs = inputs
+    h.queue.append(inputs_default := inputs_fn())
+    h.tick()
+    _no_new_orders(conn, mid)
+
+
+def test_disabled_during_fee_preparation_writes_nothing(conn):
+    mid = setup(conn)
+    h = Harness(conn, mid)
+    orig = h.prepare_fees
+
+    async def prep(**kw):
+        h.accepting = False
+        return await orig(**kw)
+    h.prepare_fees = prep
+    h.queue.append(inputs_fn())
+    h.tick()
+    _no_new_orders(conn, mid)
+
+
+def test_deadline_crossed_during_awaits_writes_nothing(conn):
+    mid = setup(conn)
+    h = Harness(conn, mid)
+    deadline = NOW + timedelta(seconds=0.5)
+    r = h.runner()
+    r.accepting = lambda: h.clock() < deadline
+    orig = h.prepare_fees
+
+    async def prep(**kw):
+        h.at(1)                                   # time passes during preparation
+        return await orig(**kw)
+    r.prepare_fees = prep
+    h.queue.append(inputs_fn())
+    asyncio.run(r.tick())
+    _no_new_orders(conn, mid)
+
+
+def test_pending_orders_still_drain_when_acceptance_stops(conn):
+    mid = setup(conn)
+    h = Harness(conn, mid)
+    h.queue.append(inputs_fn())
+    h.tick()
+    h.accepting = False
+    h.at(10)
+    h.tick()
+    assert {k: v[0] for k, v in orders(conn).items()} == {1: "filled", 2: "filled", 5: "filled"}
+
+
+def inputs_fn():
+    return inputs()
+
+
+# ---- draining keeps the cohort's frozen fee identity (review) ----------------------------
+
+def test_old_cohort_drains_with_its_frozen_account_and_policy(conn, monkeypatch):
+    mid = setup(conn)
+    h = Harness(conn, mid)
+    h.queue.append(inputs())
+    h.tick()                                      # pending under account research-c15
+    # Current code now uses a different account, precision and policy.
+    monkeypatch.setitem(rx.PARAMS, "account_id", "new-research-account")
+    monkeypatch.setitem(rx.PARAMS, "precision", "0.01")
+    monkeypatch.setitem(rx.PARAMS, "fee_policy", fctx.STRICT)
+    h.at(10)
+    h.tick(h.runner())                             # params loaded from the old manifest
+    assert {k: v[0] for k, v in orders(conn).items()} == {1: "filled", 2: "filled", 5: "filled"}
+    assert set(h.identities) == {("research-c15", fctx.CONDITIONAL_PAPER)}
+    assert wallet(conn, mid, 1).cash == D(4) - D("0.9534")            # old 0.0001 precision

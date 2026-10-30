@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 HYPERLIQUID_URL = "https://api.hyperliquid.xyz/info"
 TRACK_LEAD = timedelta(seconds=150)       # start book capture this long before close
 TRACK_TAIL = timedelta(seconds=15)        # keep it this long after close
+LIVE_HISTORY = timedelta(minutes=15)      # in-memory stream history kept (older: disk replay)
+REPLAY_CACHE = 4                          # finalized windows kept decoded in memory
 DECISION_LEAD = timedelta(seconds=65)     # only assemble inputs this close to the close
 CANDLE_REFRESH = timedelta(seconds=60)
 DISCOVERY_REFRESH = timedelta(seconds=60)
@@ -98,7 +100,8 @@ class LiveExperiment:
         self.stream = sim_exec.BookStream()             # the whole socket stream, process-wide
         self.tracked: dict[str, datetime] = {}          # ticker -> tracking start (this process)
         self.recorders: dict[str, sim_exec.BookRecorder] = {}
-        self._replayed: dict[str, sim_exec.BookTape] = {}
+        from collections import OrderedDict
+        self._replayed: "OrderedDict[str, sim_exec.BookTape]" = OrderedDict()   # bounded LRU
         self._snap_asked: dict[str, datetime] = {}
         self._market: Optional[dict] = None
         self._market_at: Optional[datetime] = None
@@ -152,6 +155,7 @@ class LiveExperiment:
         self.on_book_event(gone)
         self.tracked.pop(ticker)
         path, sha = self.recorders.pop(ticker).finalize()
+        self.stream.forget(ticker)                  # the window file is now the record
         self.conn.execute("UPDATE rx_book_files SET path=?, sha256=?, finalized_at=? WHERE "
                           "market_ticker=?", (path, sha, self.clock().isoformat(), ticker))
         self.conn.commit()
@@ -181,9 +185,11 @@ class LiveExperiment:
         """Live view if this process has been tracking the market since
         before `at`; otherwise the hash-checked replay of its window file."""
         start = self.tracked.get(ticker)
-        if start is not None and start <= at:
+        kept = self.stream.retained_from
+        if start is not None and start <= at and (kept is None or at - sim_exec.MAX_SILENCE >= kept):
             return self.stream.view(ticker)
         if ticker in self._replayed:
+            self._replayed.move_to_end(ticker)
             return self._replayed[ticker]
         r = self.conn.execute("SELECT path, sha256 FROM rx_book_files WHERE market_ticker=?",
                               (ticker,)).fetchone()
@@ -207,6 +213,8 @@ class LiveExperiment:
             return None
         if ticker not in self.tracked:
             self._replayed[ticker] = tape      # finalized files do not change
+            while len(self._replayed) > REPLAY_CACHE:
+                self._replayed.popitem(last=False)
         return tape
 
     def finalize_open_recorders(self) -> None:
@@ -250,6 +258,7 @@ class LiveExperiment:
             if close is not None and now > close + TRACK_TAIL and not busy:
                 self.untrack(t)
         await self.recover_books()
+        self.stream.trim(self.clock() - LIVE_HISTORY)
 
     async def refresh_candles(self) -> None:
         now = self.clock()
@@ -313,22 +322,24 @@ class LiveExperiment:
 
     # ---- fees and results ----------------------------------------------------------
 
-    async def prepare_fees(self, *, market_ticker: str, decided_at: datetime, arrivals: dict):
+    async def prepare_fees(self, *, market_ticker: str, decided_at: datetime, arrivals: dict,
+                           account_id: str, policy: str):
+        """Contexts for the CALLING cohort's frozen account and policy; the
+        precision comes from that account's persisted record."""
         if not self._snaps or self._snaps[0] != market_ticker:
             raise rx.ExperimentError("no metadata gathered for this decision")
         snaps = self._snaps[1]
-        kw = dict(kalshi_env="paper", account_id=rx.PARAMS["account_id"],
-                  policy=rx.PARAMS["fee_policy"], role="taker")
+        kw = dict(kalshi_env="paper", account_id=account_id, policy=policy, role="taker")
         ctx0 = fsvc.context_from_snapshots(self.service, self.conn, snaps, at=decided_at, **kw)
         later = {lat: fsvc.context_from_snapshots(self.service, self.conn, snaps, at=a, **kw)
                  for lat, a in arrivals.items()}
         return ctx0, later, fsvc.evidence_of(snaps)
 
-    def rebuild_fee(self, evidence: dict, at: datetime) -> fctx.FeeContext:
+    def rebuild_fee(self, evidence: dict, at: datetime, *, account_id: str,
+                    policy: str) -> fctx.FeeContext:
         snaps = fsvc.snapshots_from_evidence(self.service, evidence)
         return fsvc.context_from_snapshots(self.service, self.conn, snaps, kalshi_env="paper",
-                                           account_id=rx.PARAMS["account_id"],
-                                           policy=rx.PARAMS["fee_policy"], role="taker", at=at)
+                                           account_id=account_id, policy=policy, role="taker", at=at)
 
     async def result_for(self, ticker: str):
         try:
