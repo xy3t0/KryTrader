@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -28,7 +29,7 @@ WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 WS_PATH = "/trade-api/ws/v2"
 ALLOWED_CMDS = frozenset({"subscribe", "unsubscribe", "update_subscription"})
 ALLOWED_CHANNELS = frozenset({"orderbook_delta", "cfbenchmarks_value"})
-ALLOWED_ACTIONS = frozenset({"get_snapshot"})
+ALLOWED_ACTIONS = frozenset({"get_snapshot", "add_markets", "delete_markets"})
 
 
 class MarketDataError(RuntimeError):
@@ -62,12 +63,14 @@ class MarketDataClient:
         self._connect = connect
         self.ping_every_s, self.pong_timeout_s, self.sleep = ping_every_s, pong_timeout_s, sleep
         self.backoff_base_s = backoff_base_s
-        self.generation = 0
+        # Unique across process restarts, so recorded generations never collide.
+        self.generation = int(time.time() * 1000)
         self.connected = False
         self.last_error: Optional[str] = None
         self._want: set[str] = set()
-        self._sids: dict[str, int] = {}
-        self._pending: dict[int, str] = {}
+        self._have: set[str] = set()       # markets currently on the subscription
+        self._sid: Optional[int] = None    # the ONE orderbook subscription
+        self._sub_pending: Optional[int] = None
         self._id = 0
         self._ws = None
         self._want_cf = on_cf is not None
@@ -77,13 +80,14 @@ class MarketDataClient:
     def set_markets(self, tickers) -> None:
         self._want = {t for t in tickers if isinstance(t, str) and t}
 
-    async def request_snapshot(self, ticker: str) -> bool:
-        """Ask for a fresh orderbook_snapshot of an already-subscribed market."""
-        sid = self._sids.get(ticker)
-        if self._ws is None or sid is None:
+    async def request_snapshot(self, tickers) -> bool:
+        """Ask for fresh orderbook_snapshots of markets already on the subscription."""
+        tickers = sorted({tickers} if isinstance(tickers, str) else set(tickers)) 
+        tickers = [t for t in tickers if t in self._have]
+        if self._ws is None or self._sid is None or not tickers:
             return False
         await self._send({"cmd": "update_subscription",
-                          "params": {"sids": [sid], "market_tickers": [ticker],
+                          "params": {"sids": [self._sid], "market_tickers": tickers,
                                      "action": "get_snapshot"}})
         return True
 
@@ -113,16 +117,40 @@ class MarketDataClient:
         self._id += 1
         obj = {"id": self._id, **obj}
         if cmd == "subscribe" and params.get("channels") == ["orderbook_delta"]:
-            self._pending[self._id] = params["market_tickers"][0]
+            self._sub_pending = self._id
         await self._ws.send(json.dumps(obj))
 
     async def _reconcile(self) -> None:
-        for t in sorted(self._want - set(self._sids) - set(self._pending.values())):
-            await self._send({"cmd": "subscribe",
-                              "params": {"channels": ["orderbook_delta"], "market_tickers": [t]}})
-        for t in sorted(set(self._sids) - self._want):
-            sid = self._sids.pop(t)
-            await self._send({"cmd": "unsubscribe", "params": {"sids": [sid]}})
+        """Keep ONE orderbook subscription whose market set equals the wanted
+        set (Kalshi shares one seq across a subscription's markets)."""
+        if self._sub_pending is not None:
+            return                                   # wait for 'subscribed'
+        add = sorted(self._want - self._have)
+        remove = sorted(self._have - self._want)
+        if self._sid is None:
+            if add:
+                await self._send({"cmd": "subscribe",
+                                  "params": {"channels": ["orderbook_delta"], "market_tickers": add}})
+                self._have |= set(add)
+            return
+        if remove:
+            if self._want:
+                await self._send({"cmd": "update_subscription",
+                                  "params": {"sids": [self._sid], "market_tickers": remove,
+                                             "action": "delete_markets"}})
+            else:
+                await self._send({"cmd": "unsubscribe", "params": {"sids": [self._sid]}})
+                self._sid = None
+            self._have -= set(remove)
+            for t in remove:
+                self._emit("invalidate", ticker=t, reason="removed from subscription")
+        if add and self._sid is not None:
+            await self._send({"cmd": "update_subscription",
+                              "params": {"sids": [self._sid], "market_tickers": add,
+                                         "action": "add_markets"}})
+            self._have |= set(add)
+            # Whether add_markets sends a snapshot is undocumented: ask for one.
+            await self.request_snapshot(add)
 
     def _handle(self, raw: str) -> None:
         try:
@@ -134,10 +162,9 @@ class MarketDataClient:
             return
         t = m.get("type")
         if t == "subscribed":
-            ticker = self._pending.pop(m.get("id"), None)
             sid = (m.get("msg") or {}).get("sid")
-            if ticker and isinstance(sid, int):
-                self._sids[ticker] = sid
+            if m.get("id") == self._sub_pending and isinstance(sid, int):
+                self._sid, self._sub_pending = sid, None
         elif t in ("orderbook_snapshot", "orderbook_delta"):
             self._emit("msg", raw=raw)
         elif t == "cfbenchmarks_value" and self.on_cf is not None:
@@ -147,6 +174,8 @@ class MarketDataClient:
                 logger.warning(f"research_md: cf handler failed: {e}")
         elif t == "error":
             logger.warning(f"research_md: server error {m.get('msg')}")
+            if m.get("id") is not None and m.get("id") == self._sub_pending:
+                self._sub_pending, self._have = None, set()     # retry on next reconcile
 
     async def _pinger(self, ws) -> None:
         while True:
@@ -167,8 +196,7 @@ class MarketDataClient:
             self._ws = ws
             self.generation += 1
             self.connected = True
-            self._sids.clear()
-            self._pending.clear()
+            self._sid, self._sub_pending, self._have = None, None, set()
             self._emit("up")
             if self._want_cf:
                 await self._send({"cmd": "subscribe",
