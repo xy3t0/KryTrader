@@ -128,6 +128,7 @@ class BookStream:
         self._conn: list = []
         self._alive_times: list = []
         self._alive_gens: list = []
+        self.retained_from: Optional[datetime] = None   # history before this is dropped
 
     @classmethod
     def from_events(cls, events) -> "BookStream":
@@ -155,7 +156,8 @@ class BookStream:
         m = self._m(ticker)
         m.times.append(t)
         m.states.append(BookState(tuple(sorted(m.yes.items())), tuple(sorted(m.no.items())),
-                                  0, m.sid, m.gen, t, m.valid))
+                                  self._seq.get(m.sid, 0) if m.sid is not None else 0,
+                                  m.sid, m.gen, t, m.valid))
 
     def _invalidate(self, t: datetime, tickers=None) -> None:
         for tk in (self.markets if tickers is None else tickers):
@@ -260,6 +262,38 @@ class BookStream:
             self._record(ticker, t)
             return
         self._record(ticker, t)
+
+    # ---- memory bounds --------------------------------------------------------
+
+    def forget(self, ticker: str) -> None:
+        """Drop a finalized market entirely (its disk recording is the record)."""
+        self.markets.pop(ticker, None)
+
+    def trim(self, before: datetime) -> None:
+        """Drop history older than `before`, keeping what answers state_at(t)
+        for every t >= before: each market's last state before the cutoff,
+        the last connection event before it, and liveness marks from
+        before - MAX_SILENCE. Stream position (gen, seqs) is untouched."""
+        before = _aware(before)
+
+        def cut(times, *vals, keep_one=True, at=before):
+            k = bisect.bisect_left(times, at)
+            if keep_one:
+                k = max(0, k - 1)
+            if k:
+                del times[:k]
+                for v in vals:
+                    del v[:k]
+        for mk in self.markets.values():
+            cut(mk.times, mk.states)
+        cut(self._conn_times, self._conn)
+        cut(self._alive_times, self._alive_gens, keep_one=False, at=before - MAX_SILENCE)
+        if self.retained_from is None or before > self.retained_from:
+            self.retained_from = before
+
+    def history_size(self) -> int:
+        return (sum(len(m.times) for m in self.markets.values()) + len(self._conn_times)
+                + len(self._alive_times))
 
     # ---- queries ---------------------------------------------------------------
 

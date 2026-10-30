@@ -134,7 +134,8 @@ def test_production_payloads_produce_verified_inputs(env):
     assert inp.metadata_received_at <= inp.decided_at
     assert TICKER in x.tracked                                     # book capture started
     fees = run(x.prepare_fees(market_ticker=TICKER, decided_at=inp.decided_at,
-                              arrivals={1: inp.decided_at + timedelta(seconds=1)}))
+                              arrivals={1: inp.decided_at + timedelta(seconds=1)},
+                              account_id=rx.PARAMS["account_id"], policy=rx.PARAMS["fee_policy"]))
     assert fees[0].usable and fees[0].resolution.coefficient == D("0.07")
     assert fees[1][1].usable and fees[1][1].resolution.at == inp.decided_at + timedelta(seconds=1)
 
@@ -493,3 +494,70 @@ def test_startup_failure_releases_resources(env, monkeypatch):
     with pytest.raises(rx.ExperimentError):
         asyncio.run(go())
     assert conn.execute("SELECT COUNT(*) FROM rx_cohorts").fetchone()[0] == 0
+
+
+
+# ---- fee identity bound to the cohort (review) ------------------------------------------
+
+def test_fee_contexts_use_the_requested_account_and_its_persisted_precision(env):
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+    import fee_context as fctx
+    conn.execute("BEGIN")
+    fctx.register_account(conn, kalshi_env="paper", account_id="new-research-account",
+                          precision="0.01", precision_source="configured")
+    conn.commit()
+    inp = run(x.make_inputs())
+    old = run(x.prepare_fees(market_ticker=TICKER, decided_at=inp.decided_at, arrivals={},
+                             account_id="research-c15", policy=fctx.CONDITIONAL_PAPER))[0]
+    new = run(x.prepare_fees(market_ticker=TICKER, decided_at=inp.decided_at, arrivals={},
+                             account_id="new-research-account", policy=fctx.CONDITIONAL_PAPER))[0]
+    assert (old.account_id, old.precision) == ("research-c15", D("0.0001"))
+    assert (new.account_id, new.precision) == ("new-research-account", D("0.01"))
+    ev = fsvc.evidence_of(x._snaps[1])
+    rebuilt = x.rebuild_fee(ev, inp.decided_at, account_id="research-c15",
+                            policy=fctx.CONDITIONAL_PAPER)
+    assert rebuilt == old
+
+
+# ---- bounded memory over a long cohort (review) ---------------------------------------
+
+def test_many_finalized_windows_keep_memory_bounded_and_replay_unchanged(env):
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+    x.on_book_event({"t": clock().isoformat(), "kind": "up", "gen": 1})
+    SEQ["n"] = 0
+    seen = {}
+    for i in range(50):
+        tk = f"KXBTC15M-W{i:02d}-00"
+        close = clock() + timedelta(seconds=60)
+        x.track(tk, close)
+        clock.t += timedelta(milliseconds=100)
+        x.on_book_event(snapshot_event(clock, ticker=tk, bid=f"0.0{1 + i % 8}"))
+        for _ in range(6):
+            clock.t += timedelta(milliseconds=500)
+            x.on_book_event({"t": clock().isoformat(), "kind": "alive", "gen": 1})
+        probe = clock() - timedelta(seconds=1)
+        seen[tk] = (probe, x.stream.state_at(tk, probe, confirmed=True))
+        assert seen[tk][1] is not None
+        clock.t = close + timedelta(seconds=20)
+        run(x.maintain_tracking())                 # untrack + finalize + trim
+        x.untrack(tk)
+    assert len(x.stream.markets) == 0 and not x.tracked
+    # 50 windows produced 300+ liveness marks; only the last LIVE_HISTORY is kept.
+    assert x.stream.history_size() < 100
+    for tk, (probe, state) in seen.items():
+        assert x.tape_for(tk, probe).state_at(probe, confirmed=True) == state
+    assert len(x._replayed) <= live.REPLAY_CACHE
+
+
+def test_old_instant_of_a_tracked_market_falls_back_to_disk_after_trim(env):
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+    run(x.make_inputs())
+    feed_live(x, clock)
+    probe = clock() - timedelta(seconds=1)
+    before = x.stream.state_at(TICKER, probe, confirmed=True)
+    x.evidence_barrier(TICKER)
+    x.stream.trim(clock() + timedelta(minutes=1))   # memory no longer reaches `probe`
+    assert x.tape_for(TICKER, probe).state_at(probe, confirmed=True) == before
