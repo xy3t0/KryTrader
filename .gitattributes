@@ -8,3 +8,6 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
+
+# Captured API bodies are byte-exact evidence (SHA-256 checked); never rewrite them.
+python/tests/fixtures/** -text
