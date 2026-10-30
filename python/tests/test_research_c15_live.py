@@ -132,7 +132,7 @@ def test_production_payloads_produce_verified_inputs(env):
     assert inp.spot == 77650.0 and inp.spot_received_at <= inp.decided_at
     assert inp.sigma_1m is not None and inp.candles_received_at <= inp.decided_at
     assert inp.metadata_received_at <= inp.decided_at
-    assert TICKER in x.tapes                                       # book capture started
+    assert TICKER in x.tracked                                     # book capture started
     fees = run(x.prepare_fees(market_ticker=TICKER, decided_at=inp.decided_at,
                               arrivals={1: inp.decided_at + timedelta(seconds=1)}))
     assert fees[0].usable and fees[0].resolution.coefficient == D("0.07")
@@ -184,6 +184,7 @@ def test_volatility_failing_indefinitely_goes_stale(env):
     run(x2.refresh_candles())                   # one good fetch...
     x2.candle_post = candles(clock, fail=True)  # ...then the source dies for good
     x2._candles["received_at"] = clock() - timedelta(seconds=130)
+    x2._candles["newest_start"] = clock() - timedelta(seconds=150)
     inp2 = run(x2.make_inputs())
     assert inp2.sigma_1m is not None            # the old value is still reported...
     assert rx.decide(inp2, None, open_positions=0, attempted=False,
@@ -195,25 +196,89 @@ def test_far_from_close_assembles_nothing(env):
     clock.t = CLOSE - timedelta(minutes=5)
     x = experiment(conn, clock, spot, tmp)
     assert run(x.make_inputs()) is None
-    assert TICKER not in x.tapes                # book capture starts only near the close
+    assert TICKER not in x.tracked              # book capture starts only near the close
 
 
 # ---- book capture and replay -----------------------------------------------------------
 
-def snapshot_event(clock, gen=1, bid="0.05"):
-    raw = json.dumps({"type": "orderbook_snapshot", "sid": 3, "seq": 1,
-                      "msg": {"market_ticker": TICKER, "yes_dollars_fp": [],
+SEQ = {"n": 0}
+
+
+def snapshot_event(clock, gen=1, bid="0.05", ticker=None, sid=3):
+    SEQ["n"] += 1
+    raw = json.dumps({"type": "orderbook_snapshot", "sid": sid, "seq": SEQ["n"],
+                      "msg": {"market_ticker": ticker or TICKER, "yes_dollars_fp": [],
                               "no_dollars_fp": [[bid, "2.00"]]}})
     return {"t": clock().isoformat(), "kind": "msg", "gen": gen, "raw": raw}
 
 
-def feed_live(x, clock, gen=1, bid="0.05"):
-    x.on_book_event({"t": clock().isoformat(), "kind": "up", "gen": gen})
+def feed_live(x, clock, gen=1, bid="0.05", up=True):
+    if up:
+        SEQ["n"] = 0
+        x.on_book_event({"t": clock().isoformat(), "kind": "up", "gen": gen})
     clock.t += timedelta(milliseconds=100)
     x.on_book_event(snapshot_event(clock, gen, bid))
     for _ in range(4):
         clock.t += timedelta(milliseconds=500)
         x.on_book_event({"t": clock().isoformat(), "kind": "alive", "gen": gen})
+
+
+def test_market_tracked_after_socket_up_becomes_usable(env):
+    # Codex repro: up -> track -> snapshot -> alive used to stay unusable.
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+    x.on_book_event({"t": clock().isoformat(), "kind": "up", "gen": 5})
+    SEQ["n"] = 0
+    clock.t += timedelta(seconds=1)
+    run(x.make_inputs())                        # starts tracking on a live socket
+    feed_live(x, clock, gen=5, up=False)
+    assert x.stream.state_at(TICKER, clock()) is not None
+    assert x.tape_for(TICKER, clock()).state_at(clock()) is not None
+
+
+def test_second_window_on_same_connection_without_reconnect(env):
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+    run(x.make_inputs())
+    feed_live(x, clock)
+    clock.t = CLOSE + timedelta(seconds=20)
+    run(x.maintain_tracking())                  # first window finalized
+    nxt = "KXBTC15M-26OCT300715-15"
+    x.track(nxt, CLOSE + timedelta(minutes=15))
+    x.on_book_event(snapshot_event(clock, ticker=nxt))
+    for _ in range(3):
+        clock.t += timedelta(milliseconds=500)
+        x.on_book_event({"t": clock().isoformat(), "kind": "alive", "gen": 1})
+    assert x.stream.state_at(nxt, clock()) is not None
+    # Its recording starts with an attach header and replays to the same book.
+    events = sx.BookRecorder.load(x.recorders[nxt].path)
+    assert events[0]["kind"] == "attach"
+    assert sx.BookTape.from_events(nxt, events).state_at(clock()) == x.stream.state_at(nxt, clock())
+
+
+def test_gap_triggers_automatic_snapshot_request(env):
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+
+    class MD:
+        connected = True
+        asked = []
+
+        def set_markets(self, m):
+            pass
+
+        async def request_snapshot(self, tickers):
+            MD.asked.append(list(tickers))
+    x.md = MD()
+    run(x.make_inputs())
+    feed_live(x, clock)
+    SEQ["n"] += 5                               # the stream skipped messages
+    x.on_book_event(snapshot_event(clock, ticker="KXOTHER-1"))
+    assert x.stream.state_at(TICKER, clock()) is None
+    run(x.recover_books())
+    assert MD.asked == [[TICKER]]
+    run(x.recover_books())                      # rate-limited: not asked again at once
+    assert MD.asked == [[TICKER]]
 
 
 def test_book_events_recorded_and_replayed_identically(env):
@@ -222,34 +287,35 @@ def test_book_events_recorded_and_replayed_identically(env):
     run(x.make_inputs())
     feed_live(x, clock)
     t = clock()
-    live_state = x.tapes[TICKER].state_at(t)
+    live_state = x.stream.state_at(TICKER, t)
     assert live_state is not None and live_state.no[0][0] == D("0.05")
     clock.t = CLOSE + timedelta(seconds=20)
     run(x.maintain_tracking())                  # past close + tail: finalize to .gz
-    assert TICKER not in x.tapes
+    assert TICKER not in x.tracked
     path, sha = conn.execute("SELECT path, sha256 FROM rx_book_files").fetchone()
     assert path.endswith(".jsonl.gz") and len(sha) == 64
-    replay = x.tape_for(TICKER, t)
-    assert replay.state_at(t) == live_state
+    assert x.tape_for(TICKER, t).state_at(t) == live_state
 
 
-def test_restart_resumes_window_file_and_reproduces_history(env):
+def test_restart_uses_recorded_history_for_earlier_instants(env):
     conn, clock, spot, tmp = env
     x = experiment(conn, clock, spot, tmp)
     run(x.make_inputs())
     feed_live(x, clock)
     t_before = clock()
-    before = x.tapes[TICKER].state_at(t_before)
-    x.finalize_open_recorders()                 # process stops (file left open-ended)
-    y = experiment(conn, clock, spot, tmp)      # new process
-    run(y.make_inputs())
-    assert y.tapes[TICKER].state_at(t_before) == before          # history reloaded
+    before = x.stream.state_at(TICKER, t_before)
+    x.finalize_open_recorders()                 # process stops
     clock.t += timedelta(seconds=1)
+    y = experiment(conn, clock, spot, tmp)      # new process, new connection generation
+    run(y.make_inputs())
+    assert y.tape_for(TICKER, t_before).state_at(t_before) == before    # from the file
     feed_live(y, clock, gen=2, bid="0.04")
-    assert y.tapes[TICKER].state_at(clock()).no[0][0] == D("0.04")
+    assert y.tape_for(TICKER, clock()).state_at(clock()).no[0][0] == D("0.04")
+    events = sx.BookRecorder.load(y.recorders[TICKER].path)
+    assert [e["kind"] for e in events].count("attach") == 2
 
 
-def test_tampered_book_file_is_not_used(env):
+def test_tampered_or_missing_book_file_is_not_used(env):
     conn, clock, spot, tmp = env
     x = experiment(conn, clock, spot, tmp)
     run(x.make_inputs())
@@ -260,80 +326,154 @@ def test_tampered_book_file_is_not_used(env):
     Path(path).write_bytes(b"tampered")
     x._replayed.clear()
     assert x.tape_for(TICKER, clock()) is None
+    Path(path).unlink()
+    assert x.tape_for(TICKER, clock()) is None
 
 
-def test_book_event_for_other_market_ignored(env):
+def test_book_event_for_other_market_on_same_sid_keeps_ours(env):
     conn, clock, spot, tmp = env
     x = experiment(conn, clock, spot, tmp)
     run(x.make_inputs())
     feed_live(x, clock)
-    other = json.dumps({"type": "orderbook_delta", "sid": 9, "seq": 5,
-                        "msg": {"market_ticker": "KXETH15M-X", "side": "no",
-                                "price_dollars": "0.05", "delta_fp": "-2.00"}})
-    x.on_book_event({"t": clock().isoformat(), "kind": "msg", "gen": 1, "raw": other})
-    assert x.tapes[TICKER].state_at(clock()) is not None
+    x.on_book_event(snapshot_event(clock, ticker="KXETH15M-X"))       # next seq, same sid
+    assert x.stream.state_at(TICKER, clock()) is not None
+
+
+def test_candle_series_validation():
+    now = datetime(2026, 10, 30, 10, 59, 35, tzinfo=UTC)
+    base = int(now.timestamp() // 60 * 60 * 1000)
+    good = [{"t": base - (40 - i) * 60_000, "c": str(77500 + i)} for i in range(41)]
+    closes, newest = rx.candle_series(list(reversed(good)), now, window=30)  # unordered input
+    assert closes == [77500.0 + i for i in range(41)] and newest.timestamp() * 1000 == base
+    dup = good + [dict(good[-1])]
+    assert rx.candle_series(dup, now, window=30)[0] == closes                 # exact duplicate
+    for bad in (good + [{"t": base + 86_400_000, "c": "1"}],                   # future
+                good + [dict(good[-1], c="99999")],                            # conflicting dup
+                good[:20] + good[21:],                                         # missing minute
+                good[:-1] + [{"t": base, "c": "nan"}],                         # malformed close
+                good[:-1] + [{"t": base + 1, "c": "1"}],                       # not a minute boundary
+                good[:10]):                                                    # too few
+        with pytest.raises(rx.CandleError):
+            rx.candle_series(bad, now, window=30)
+
+
+def test_invalid_candles_never_produce_a_forecast(env):
+    conn, clock, spot, tmp = env
+
+    def bad_post(c):
+        async def post(req):
+            end = int(c().timestamp() // 60 * 60 * 1000)
+            rows = [{"t": end - (40 - i) * 60_000, "c": "77500"} for i in range(41)]
+            rows.append({"t": end + 3_600_000, "c": "77500"})               # future candle
+            return 200, json.dumps(rows).encode()
+        return post
+    x = experiment(conn, clock, spot, tmp, post=bad_post(clock))
+    inp = run(x.make_inputs())
+    assert inp.sigma_1m is None
+    assert rx.decide(inp, None, open_positions=0, attempted=False,
+                     quarantined=False).reason == "missing_volatility"
 
 
 # ---- startup ---------------------------------------------------------------------------
 
 class FakeMD:
+    """One shared-seq orderbook subscription; snapshots on add or request."""
+
     def __init__(self, on_event, clock):
         self.on_event, self.clock = on_event, clock
         self.connected, self.last_error, self.markets = False, None, set()
+        self.pending, self.seq = set(), 0
 
     def set_markets(self, m):
+        self.pending |= set(m) - self.markets
         self.markets = set(m)
+
+    async def request_snapshot(self, tickers):
+        self.pending |= set(tickers)
+        return True
 
     async def run(self, stop):
         self.connected = True
         self.on_event({"t": self.clock().isoformat(), "kind": "up", "gen": 1})
-        sent = False
         while not stop.is_set():
-            if self.markets and not sent:
-                for t in self.markets:
-                    self.on_event({**snapshot_event(self.clock), "raw": json.dumps(
-                        {"type": "orderbook_snapshot", "sid": 3, "seq": 1,
-                         "msg": {"market_ticker": t, "yes_dollars_fp": [],
-                                 "no_dollars_fp": [["0.05", "2.00"]]}})})
-                sent = True
+            for t in sorted(self.pending & self.markets):
+                self.seq += 1
+                self.on_event({"t": self.clock().isoformat(), "kind": "msg", "gen": 1,
+                               "raw": json.dumps({"type": "orderbook_snapshot", "sid": 3,
+                                                  "seq": self.seq,
+                                                  "msg": {"market_ticker": t, "yes_dollars_fp": [],
+                                                          "no_dollars_fp": [["0.05", "2.00"]]}})})
+            self.pending.clear()
             self.on_event({"t": self.clock().isoformat(), "kind": "alive", "gen": 1})
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.005)
         self.connected = False
 
 
-def start_run(env, monkeypatch, *, spot_reads):
+class SettlingKalshi(Kalshi):
+    async def __call__(self, url, params):
+        self.result = "yes" if self.clock() > CLOSE + timedelta(seconds=5) else ""
+        return await super().__call__(url, params)
+
+
+def start_run(env, monkeypatch, *, spot_reads, start, real_s=0.4, step=None, prints=None):
     conn, clock, spot, tmp = env
     import kalshi_auth
     monkeypatch.setattr(kalshi_auth, "is_paper", lambda env=None: True)
-    clock.t = CLOSE - timedelta(seconds=70)        # tracking window, before decisions
+    clock.t = start
 
     async def go():
         stop = asyncio.Event()
+
+        async def advance():
+            while step and not stop.is_set():
+                await asyncio.sleep(0.01)
+                clock.t += step
+        adv = asyncio.ensure_future(advance())
         task = asyncio.ensure_future(live.run(
             lambda: {"research_c15_enabled": True}, stop,
-            make_md=lambda on_event: FakeMD(on_event, clock), send=Kalshi(clock),
+            make_md=lambda on_event, on_cf: FakeMD(on_event, clock), send=SettlingKalshi(clock),
             candle_post=candles(clock), clock=clock, spot_reads=spot_reads,
-            prints=lambda c, n: (0.0, 0, "none"), local_time=lambda: clock().timestamp(),
-            tick_s=0.02))
-        await asyncio.sleep(0.4)
+            prints=prints or (lambda c, n: (0.0, 0, "none")),
+            local_time=lambda: clock().timestamp(), tick_s=0.005))
+        await asyncio.sleep(real_s)
         stop.set()
-        await asyncio.wait_for(task, 5)
+        await asyncio.wait_for(task, 10)
+        await adv
     asyncio.run(go())
 
 
-def test_paper_startup_launches_only_after_readiness(env, monkeypatch):
+def test_paper_startup_waits_for_a_usable_book_and_spot(env, monkeypatch):
     conn, clock, spot, tmp = env
-    start_run(env, monkeypatch, spot_reads=lambda: [])               # no spot: not ready
-    st = conn.execute("SELECT status, launched_at FROM rx_cohorts").fetchall()
-    assert st == [("armed", None)]                                   # 90 days not consumed
-    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77650.0)]  # noqa: E731
-    start_run(env, monkeypatch, spot_reads=fresh)
-    st = conn.execute("SELECT status, launched_at FROM rx_cohorts").fetchall()
-    assert st[0][0] == "active" and st[0][1] is not None
-    # The book capture received the snapshot for the tracked market.
-    path = Path(conn.execute("SELECT path FROM rx_book_files").fetchone()[0])
-    events = sx.BookRecorder.load(path if path.exists() else path.with_suffix(".jsonl.gz"))
-    assert any(e["kind"] == "msg" for e in events)
+    start_run(env, monkeypatch, spot_reads=lambda: [], start=CLOSE - timedelta(seconds=70))
+    assert conn.execute("SELECT status, launched_at FROM rx_cohorts").fetchall() == [("armed", None)]
+    # Outside the book window nothing is tracked, so readiness waits too.
+    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
+    start_run(env, monkeypatch, spot_reads=fresh, start=CLOSE - timedelta(minutes=10))
+    assert conn.execute("SELECT status FROM rx_cohorts").fetchall() == [("armed",)]
+
+
+def test_startup_to_settlement_end_to_end(env, monkeypatch):
+    """Paper start -> book usable -> launch -> eligible decision -> admission
+    -> simulated fills after each latency -> settlement, all from the
+    production-shaped captured payloads."""
+    conn, clock, spot, tmp = env
+    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
+
+    def prints(close_e, now_e):
+        n = int(60 - (close_e - now_e))
+        return (77700.0 * n, n, "coinbase_proxy") if n > 0 else (0.0, 0, "none")
+    start_run(env, monkeypatch, spot_reads=fresh, prints=prints, start=CLOSE - timedelta(seconds=80),
+              step=timedelta(seconds=0.5), real_s=3.0)
+    assert conn.execute("SELECT status FROM rx_cohorts").fetchone()[0] == "active"
+    eligible = conn.execute("SELECT COUNT(*) FROM rx_decisions WHERE eligible=1").fetchone()[0]
+    assert eligible == 1                                       # one attempt per event
+    st = dict(conn.execute("SELECT latency_s, state FROM rx_orders").fetchall())
+    assert st == {1: "filled", 2: "filled", 5: "filled"}
+    mid = conn.execute("SELECT manifest_id FROM rx_cohorts").fetchone()[0]
+    import research_wallet as rw
+    w = rw.get_wallet(conn, rx.wallet_id(mid, 1))
+    assert w.cash == D(4) - D("0.9534") + 1 and w.reserved == 0          # bought at 95c, won
+    assert rw.reconcile(conn, rx.wallet_id(mid, 1))["ok"]
 
 
 def test_startup_failure_releases_resources(env, monkeypatch):
@@ -347,7 +487,7 @@ def test_startup_failure_releases_resources(env, monkeypatch):
 
     async def go():
         await live.run(lambda: {"research_c15_enabled": True}, asyncio.Event(),
-                       make_md=lambda on_event: FakeMD(on_event, clock), send=Kalshi(clock),
+                       make_md=lambda on_event, on_cf: FakeMD(on_event, clock), send=Kalshi(clock),
                        candle_post=candles(clock), clock=clock, spot_reads=lambda: [],
                        prints=lambda c, n: (0.0, 0, "none"))
     with pytest.raises(rx.ExperimentError):

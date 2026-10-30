@@ -51,12 +51,13 @@ def server_now() -> datetime:
     return datetime.fromtimestamp(kalshi_auth.server_now(), timezone.utc)
 
 
-def default_spot_reads() -> list[tuple[str, float, float]]:
-    """(source, local_epoch_received, price) for every live BTC spot."""
-    import cf_ws
+def default_spot_reads(cf_state) -> list[tuple[str, float, float]]:
+    """(source, local_epoch_received, price) for every live BTC spot. CF
+    values come from the experiment's PRIVATE cf state (fed only by its own
+    socket), never the app-wide cache."""
     import spot_ws
     out = []
-    v = cf_ws._client.values.get(rx.PARAMS["asset"])
+    v = cf_state.values.get(rx.PARAMS["asset"]) if cf_state is not None else None
     if v:
         out.append(("cf_index", v[0], v[1]))
     p = spot_ws._client.prices.get(rx.PARAMS["asset"])
@@ -65,10 +66,10 @@ def default_spot_reads() -> list[tuple[str, float, float]]:
     return out
 
 
-def default_prints(close_epoch: float, decided_epoch: float) -> tuple[float, int, str]:
-    import cf_ws
+def default_prints(cf_state, close_epoch: float, decided_epoch: float) -> tuple[float, int, str]:
     import spot_ws
-    s, n = cf_ws.settle_partial(rx.PARAMS["asset"], close_epoch)
+    s, n = (cf_state.settle_partial(rx.PARAMS["asset"], close_epoch) if cf_state is not None
+            else (0.0, 0))
     if n:
         return float(s), int(n), "cf_index"
     s, n = spot_ws.window_partial(rx.PARAMS["asset"], close_epoch, now=decided_epoch)
@@ -81,18 +82,24 @@ class LiveExperiment:
     def __init__(self, conn: sqlite3.Connection, *, capturer: fcap.FeeMetadataCapturer,
                  service: fsvc.FeeMetadataService, book_dir: Path,
                  clock: Callable[[], datetime] = server_now,
-                 spot_reads: Callable[[], list] = default_spot_reads,
-                 prints: Callable[[float, float], tuple] = default_prints,
+                 spot_reads: Optional[Callable[[], list]] = None,
+                 prints: Optional[Callable[[float, float], tuple]] = None,
                  candle_post: Optional[Callable[[dict], Awaitable[tuple[int, bytes]]]] = None,
                  local_time: Callable[[], float] = time.time):
+        import cf_ws
         self.conn, self.capturer, self.service = conn, capturer, service
         self.book_dir, self.clock = Path(book_dir), clock
-        self.spot_reads, self.prints, self.candle_post = spot_reads, prints, candle_post
+        self.cf = cf_ws._State()                         # private: not the app-wide cache
+        self.spot_reads = spot_reads or (lambda: default_spot_reads(self.cf))
+        self.prints = prints or (lambda c, n: default_prints(self.cf, c, n))
+        self.candle_post = candle_post
         self.local_time = local_time
         self.md = None                                  # research_md.MarketDataClient
-        self.tapes: dict[str, sim_exec.BookTape] = {}
+        self.stream = sim_exec.BookStream()             # the whole socket stream, process-wide
+        self.tracked: dict[str, datetime] = {}          # ticker -> tracking start (this process)
         self.recorders: dict[str, sim_exec.BookRecorder] = {}
         self._replayed: dict[str, sim_exec.BookTape] = {}
+        self._snap_asked: dict[str, datetime] = {}
         self._market: Optional[dict] = None
         self._market_at: Optional[datetime] = None
         self._candles: Optional[dict] = None
@@ -100,58 +107,82 @@ class LiveExperiment:
 
     # ---- book events ------------------------------------------------------------
 
+    def _write_all(self, ev: dict) -> None:
+        for rec in self.recorders.values():
+            rec.write(ev)
+
     def on_book_event(self, ev: dict) -> None:
-        """Every research_md event goes to every tracked market's recorder
-        and tape (connection/liveness events concern all of them)."""
-        for t in list(self.tapes):
-            if ev.get("kind") == "msg":
-                try:
-                    tk = (json.loads(ev["raw"]).get("msg") or {}).get("market_ticker")
-                except (ValueError, AttributeError, TypeError):
-                    tk = None
-                if tk not in (t, None):
-                    continue
+        """Every socket event goes to the process-wide stream and to every
+        open window recording (the shared seq needs the whole stream)."""
+        try:
+            self._write_all(ev)
+            self.stream.feed(ev)
+        except Exception as e:
+            logger.error(f"[c15] book event failed: {e}")
+            bad = {"t": ev.get("t") or self.clock().isoformat(), "kind": "invalidate",
+                   "reason": f"apply failed: {e}"[:200]}
             try:
-                self.recorders[t].write(ev)
-                self.tapes[t].feed(ev)
-            except Exception as e:
-                logger.error(f"[c15] book event for {t} failed: {e}")
-                bad = {"t": ev.get("t"), "kind": "invalidate", "reason": f"apply failed: {e}"[:200]}
-                try:
-                    self.recorders[t].write(bad)
-                    self.tapes[t].feed(bad)
-                except Exception:
-                    pass
+                self._write_all(bad)
+                self.stream.feed(bad)
+            except Exception:
+                pass
 
     def track(self, ticker: str, close: datetime) -> None:
-        if ticker in self.tapes:
+        if ticker in self.tracked:
             return
-        rec = sim_exec.BookRecorder(self.book_dir, ticker)
-        # After a restart the window file already holds earlier events: the
-        # live tape starts from them, so it equals a replay of the file.
-        prior = sim_exec.BookRecorder.load(rec.path) if rec.path.stat().st_size else []
+        rec = sim_exec.BookRecorder(self.book_dir, ticker)      # drops a torn tail
+        now = self.clock()
+        # The recording starts mid-stream: an attach header carries the
+        # stream's position so a replay checks continuity from here on.
+        rec.write({"t": now.isoformat(), "kind": "attach", **self.stream.position()})
         self.recorders[ticker] = rec
-        self.tapes[ticker] = sim_exec.BookTape.from_events(ticker, prior)
+        self.tracked[ticker] = now
         self.conn.execute("INSERT OR IGNORE INTO rx_book_files (market_ticker, close_time, path) "
                           "VALUES (?,?,?)", (ticker, close.isoformat(), str(rec.path)))
         self.conn.commit()
+        self._replayed.pop(ticker, None)
         if self.md is not None:
-            self.md.set_markets(set(self.tapes))
+            self.md.set_markets(set(self.tracked))
 
     def untrack(self, ticker: str) -> None:
-        if ticker not in self.tapes:
+        if ticker not in self.tracked:
             return
-        self.tapes.pop(ticker)
+        gone = {"t": self.clock().isoformat(), "kind": "invalidate", "ticker": ticker,
+                "reason": "untracked"}
+        self.on_book_event(gone)
+        self.tracked.pop(ticker)
         path, sha = self.recorders.pop(ticker).finalize()
         self.conn.execute("UPDATE rx_book_files SET path=?, sha256=?, finalized_at=? WHERE "
                           "market_ticker=?", (path, sha, self.clock().isoformat(), ticker))
         self.conn.commit()
         if self.md is not None:
-            self.md.set_markets(set(self.tapes))
+            self.md.set_markets(set(self.tracked))
+
+    def evidence_barrier(self, ticker: str) -> None:
+        """Book evidence for `ticker` is fsynced before dependent records commit."""
+        rec = self.recorders.get(ticker)
+        if rec is not None:
+            rec.sync()
+
+    async def recover_books(self) -> None:
+        """Request fresh snapshots for tracked markets without a valid book
+        (new market, gap, reconnect), at most every 2 s per market."""
+        if self.md is None or not self.md.connected:
+            return
+        now = self.clock()
+        due = [t for t in self.stream.needs_snapshot(self.tracked)
+               if now - self._snap_asked.get(t, now - timedelta(days=1)) >= timedelta(seconds=2)]
+        if due:
+            for t in due:
+                self._snap_asked[t] = now
+            await self.md.request_snapshot(due)
 
     def tape_for(self, ticker: str, at: datetime) -> Optional[sim_exec.BookTape]:
-        if ticker in self.tapes:
-            return self.tapes[ticker]
+        """Live view if this process has been tracking the market since
+        before `at`; otherwise the hash-checked replay of its window file."""
+        start = self.tracked.get(ticker)
+        if start is not None and start <= at:
+            return self.stream.view(ticker)
         if ticker in self._replayed:
             return self._replayed[ticker]
         r = self.conn.execute("SELECT path, sha256 FROM rx_book_files WHERE market_ticker=?",
@@ -169,13 +200,23 @@ class LiveExperiment:
             if hashlib.sha256(p.read_bytes()).hexdigest() != r[1]:
                 logger.error(f"[c15] book file for {ticker} fails its hash; not used")
                 return None
-        tape = sim_exec.BookTape.from_events(ticker, sim_exec.BookRecorder.load(p))
-        self._replayed[ticker] = tape
+        try:
+            tape = sim_exec.BookTape.from_events(ticker, sim_exec.BookRecorder.load(p))
+        except Exception as e:
+            logger.error(f"[c15] book file for {ticker} unreadable: {e}")
+            return None
+        if ticker not in self.tracked:
+            self._replayed[ticker] = tape      # finalized files do not change
         return tape
 
     def finalize_open_recorders(self) -> None:
-        """At shutdown: close (not gzip) open files; a restart replays them."""
+        """At shutdown: sync and close (not gzip) open files; a restart
+        appends to them after a fresh attach header."""
         for rec in self.recorders.values():
+            try:
+                rec.sync()
+            except Exception:
+                pass
             rec.close()
 
     # ---- discovery and metadata -----------------------------------------------------
@@ -200,14 +241,15 @@ class LiveExperiment:
         m = await self.current_market()
         if m is not None and _close(m) - now <= TRACK_LEAD:
             self.track(m["ticker"], _close(m))
-        for t in list(self.tapes):
+        for t in list(self.tracked):
             r = self.conn.execute("SELECT close_time FROM rx_book_files WHERE market_ticker=?",
                                   (t,)).fetchone()
             close = datetime.fromisoformat(r[0]) if r else None
-            busy = self.conn.execute("SELECT 1 FROM rx_orders WHERE market_ticker=? AND state="
-                                     "'pending'", (t,)).fetchone()
+            busy = self.conn.execute("SELECT 1 FROM rx_orders WHERE market_ticker=? AND state IN "
+                                     "('pending','unresolved')", (t,)).fetchone()
             if close is not None and now > close + TRACK_TAIL and not busy:
                 self.untrack(t)
+        await self.recover_books()
 
     async def refresh_candles(self) -> None:
         now = self.clock()
@@ -228,20 +270,11 @@ class LiveExperiment:
                                                          "request": req})
             if status != 200:
                 raise RuntimeError(f"HTTP {status}")
-            rows = json.loads(body)
-            if not isinstance(rows, list):
-                raise RuntimeError("unexpected candle shape")
-            closes, starts = [], []
-            for r in rows:
-                if isinstance(r, dict) and r.get("c") and isinstance(r.get("t"), int):
-                    closes.append(float(r["c"]))
-                    starts.append(r["t"])
-            if not starts:
-                raise RuntimeError("no candles")
             import indicators
+            closes, newest = rx.candle_series(json.loads(body), received,
+                                              window=indicators.SIGMA_WINDOW)
             self._candles = {"sigma": indicators.sigma1m(closes), "received_at": received,
-                             "newest_start": datetime.fromtimestamp(max(starts) / 1000, timezone.utc),
-                             "capture_id": rec.capture_id}
+                             "newest_start": newest, "capture_id": rec.capture_id}
         except Exception as e:
             logger.warning(f"[c15] candle refresh failed: {e}")   # old candles age out
 
@@ -337,6 +370,10 @@ class LiveExperiment:
         rules = rx.validate_rules(mk, ev)
         if not rules.ok:
             return False, f"settlement rules not verified: {rules.detail}"
+        if m["ticker"] not in self.tracked:
+            return False, "waiting for the next market's book window"
+        if self.stream.state_at(m["ticker"], self.clock()) is None:
+            return False, "order book not yet usable"
         return True, "ready"
 
 
@@ -399,19 +436,16 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
         if accepting_mid is None:
             logger.warning(f"[c15] code/config differs from the active cohort; current manifest "
                            f"{mid[:16]} needs research_c15_activate to start a new cohort")
-        draining = [r[0] for r in conn.execute("SELECT manifest_id FROM rx_cohorts WHERE "
-                                               "manifest_id != ?", (mid,))
-                    if rx.outstanding(conn, r[0])]
+        cohorts = rx.runner_cohorts(conn, mid, accepting_mid)
 
         if make_md is None:
-            import cf_ws
             import research_md
             import spot_ws
             if not spot_ws.is_running():
                 spot_ws.start()
-            make_md = lambda on_event: research_md.MarketDataClient(  # noqa: E731
-                on_event=on_event, on_cf=cf_ws.handle_message)
-        live.md = make_md(live.on_book_event)
+            make_md = lambda on_event, on_cf: research_md.MarketDataClient(  # noqa: E731
+                on_event=on_event, on_cf=on_cf)
+        live.md = make_md(live.on_book_event, live.cf.handle_message)
         md_task = asyncio.ensure_future(live.md.run(md_stop))
 
         def enabled() -> bool:
@@ -423,14 +457,18 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
                 ch = rx.cohort(conn, m)
                 if not ch or ch["status"] != "active" or not enabled():
                     return False
-                return clock() < ch["launched_at"] + timedelta(days=rx.PARAMS["duration_days"])
+                days = rx.cohort_params(conn, m)["duration_days"]
+                return clock() < ch["launched_at"] + timedelta(days=days)
             return f
 
+        # Every cohort with outstanding work drains with ITS frozen params.
         runners = [rx.C15Runner(conn, mid=m, accepting=accepting_for(m),
                                 inputs=live.make_inputs, tape_for=live.tape_for,
                                 prepare_fees=live.prepare_fees, rebuild_fee=live.rebuild_fee,
-                                result_for=live.result_for, clock=clock)
-                   for m in ([accepting_mid] if accepting_mid else []) + draining]
+                                result_for=live.result_for, clock=clock,
+                                params=rx.cohort_params(conn, m),
+                                evidence_barrier=live.evidence_barrier)
+                   for m in cohorts]
         last_ready_log = None
         while not stop.is_set():
             try:
@@ -449,7 +487,7 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
                 await live.maintain_tracking()
                 for r in runners:
                     await r.tick()
-                if not enabled() and not any(rx.outstanding(conn, r.mid) for r in runners):
+                if not enabled() and not any(rx.outstanding(conn, r.mid, r.p) for r in runners):
                     return
             except Exception as e:
                 logger.error(f"[c15] tick failed: {e}", exc_info=True)
