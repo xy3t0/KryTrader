@@ -252,7 +252,10 @@ def test_decide_eligible_uses_unrounded_model():
     (dict(metadata_received_at=NOW + timedelta(seconds=1)), "input_from_future:metadata"),
     (dict(metadata_received_at=NOW - timedelta(seconds=31)), "stale_metadata"),
     (dict(candles_received_at=NOW + timedelta(seconds=1)), "input_from_future:candles"),
-    (dict(candles_received_at=NOW - timedelta(seconds=121)), "stale_volatility"),
+    (dict(candles_received_at=NOW - timedelta(seconds=121),
+          newest_candle_start=NOW - timedelta(seconds=150)), "stale_volatility"),
+    (dict(newest_candle_start=NOW + timedelta(days=1)), "input_from_future:candle_start"),
+    (dict(newest_candle_start=NOW - timedelta(seconds=20)), "input_from_future:candle_start"),
     (dict(newest_candle_start=NOW - timedelta(minutes=10)), "stale_volatility"),
     (dict(sigma_1m=None), "missing_volatility"),
     (dict(rules=rx.RulesCheck(False, "payout")), "settlement_rules_unverified:payout"),
@@ -670,3 +673,157 @@ def test_no_order_routing_reachable():
     for forbidden in ("place_limit_order", "kalshi_api.place", "create_order", "submit_order",
                       "trader.execute", "/portfolio/orders"):
         assert forbidden not in src
+
+
+# ---- missing execution evidence (review: must never become a no-fill) -----------------
+
+def _process_with_tape(conn, tape):
+    mid = setup(conn)
+    h = Harness(conn, mid)
+    h.queue.append(inputs())
+    h.tick()                                   # admitted with the good book
+    h.tape = tape
+    h.at(10)
+    h.tick()
+    return mid, h
+
+
+def _assert_unresolved(conn, mid):
+    o = orders(conn)
+    assert {k: v[0] for k, v in o.items()} == {1: "unresolved", 2: "unresolved", 5: "unresolved"}
+    for lat in (1, 2, 5):
+        w = wallet(conn, mid, lat)
+        assert w.reserved > 0 and w.cash == D(4)          # held, not a zero-cost no-trade
+    assert conn.execute("SELECT COUNT(*) FROM rx_quarantine").fetchone()[0] == 3
+    assert rx.outstanding(conn, mid) == 3
+
+
+class _NoTape:
+    """tape_for returning None: archive missing or failing its hash."""
+
+
+def test_missing_or_corrupt_archive_leaves_execution_unresolved(conn):
+    mid, h = _process_with_tape(conn, None)
+    h.tape_for = lambda ticker, at: None
+    h.tick()
+    _assert_unresolved(conn, mid)
+
+
+def test_disconnect_across_arrival_is_unresolved(conn):
+    down = {"t": ev_t(0.5), "kind": "down", "gen": 1}
+    mid, h = _process_with_tape(conn, book(extra=[down]))
+    _assert_unresolved(conn, mid)
+
+
+def test_torn_recording_before_arrival_is_unresolved(conn):
+    torn = sx.BookTape.from_events(MKT, [e for e in book_events() if e["t"] <= ev_t(0.3)])
+    mid, h = _process_with_tape(conn, torn)
+    _assert_unresolved(conn, mid)
+
+
+def test_recovered_evidence_resolves_and_lifts_quarantine(conn):
+    mid, h = _process_with_tape(conn, None)
+    h.tape_for = lambda ticker, at: None
+    h.tick()
+    _assert_unresolved(conn, mid)
+    h.tape_for = lambda ticker, at: book() if ticker == MKT else None     # archive recovered
+    h.tick()
+    assert {k: v[0] for k, v in orders(conn).items()} == {1: "filled", 2: "filled", 5: "filled"}
+    assert conn.execute("SELECT COUNT(*) FROM rx_quarantine").fetchone()[0] == 0
+    assert wallet(conn, mid, 1).reserved == 0
+
+
+def test_valid_empty_book_is_the_only_no_fill(conn):
+    gone = json.dumps({"type": "orderbook_delta", "sid": 1, "seq": 2,
+                       "msg": {"market_ticker": MKT, "side": "no", "price_dollars": "0.05",
+                               "delta_fp": "-3.00"}})
+    mid, h = _process_with_tape(conn, book(extra=[{"t": ev_t(0.5), "kind": "msg", "gen": 1,
+                                                   "raw": gone}]))
+    assert {k: v[0] for k, v in orders(conn).items()} == {1: "no_fill", 2: "no_fill", 5: "no_fill"}
+    assert wallet(conn, mid, 1).reserved == 0
+
+
+def test_unresolved_primary_blocks_new_entries(conn):
+    mid, h = _process_with_tape(conn, None)
+    h.tape_for = lambda ticker, at: None
+    h.tick()
+    later = NOW + timedelta(seconds=10)
+    h.tape_for = lambda ticker, at: None
+    h.queue.append(inputs(event_ticker=EV + "B", decided_at=later,
+                          spot_received_at=later - timedelta(seconds=1),
+                          metadata_received_at=later - timedelta(seconds=1)))
+    h.tick()
+    assert conn.execute("SELECT reason FROM rx_decisions ORDER BY id DESC LIMIT 1").fetchone()[0] \
+        == "primary_scenario_quarantined"
+
+
+# ---- every cohort with outstanding work drains (review: A -> B -> A) -----------------
+
+def _cohort(conn, body, activate=None):
+    conn.execute("BEGIN")
+    mid = rx.ensure_manifest(conn, body, NOW)
+    acc = rx.select_cohort(conn, mid, activate=activate, now=NOW)
+    if acc:
+        rx.setup_wallets(conn, acc)
+        rx.launch(conn, acc, NOW)
+    conn.commit()
+    return mid, acc
+
+
+def test_rollback_to_a_suspended_manifest_still_drains_it(conn):
+    base = rx.manifest_body()
+    a, _ = _cohort(conn, base)
+    ha = Harness(conn, a)
+    ha.queue.append(inputs())
+    ha.tick()                                              # A: three pending orders
+    b, _ = _cohort(conn, {**base, "x": "B"})
+    b_acc = rx.select_cohort(conn, b, activate=b[:12], now=NOW)
+    assert b_acc == b and rx.cohort(conn, a)["status"] == "suspended"
+    # Code rolled back to A: A is suspended, so it cannot accept entries...
+    assert rx.select_cohort(conn, a, activate=None, now=NOW) is None
+    # ...but it is still drained.
+    assert a in rx.runner_cohorts(conn, a, None)
+    ha.accepting = False
+    ha.at(10)
+    ha.tick()
+    assert rx.outstanding(conn, a) == 0 or {r[0] for r in conn.execute(
+        "SELECT state FROM rx_orders WHERE manifest_id=?", (a,))} == {"filled"}
+
+
+def test_runner_cohorts_dedupes_and_includes_unpriced_and_open_positions(conn):
+    base = rx.manifest_body()
+    a, _ = _cohort(conn, base)
+    ha = Harness(conn, a)
+    ha.queue.append(inputs())
+    ha.tick()
+    ha.fee_ok = False
+    ha.at(10)
+    ha.tick()                                              # A: unpriced executions
+    assert rx.runner_cohorts(conn, a, a) == [a]            # accepting, listed once
+    b, b_acc = _cohort(conn, {**base, "x": "B"}, activate=None)
+    assert b_acc is None
+    assert rx.runner_cohorts(conn, b, None) == [a]
+    ha.fee_ok = True
+    ha.tick()                                              # priced: positions remain open
+    assert a in rx.runner_cohorts(conn, b, None)
+    ha.at(40)
+    ha.tick()                                              # settled: nothing left
+    assert rx.runner_cohorts(conn, b, None) == []
+
+
+def test_draining_uses_the_cohorts_own_frozen_params(conn):
+    base = rx.manifest_body()
+    alt = {**base, "params": {**base["params"], "latencies_s": [1, 3], "fill_grace_s": 0}}
+    a, _ = _cohort(conn, alt)
+    assert rx.cohort_params(conn, a)["latencies_s"] == [1, 3]
+    ha = Harness(conn, a)
+    ha.queue.append(inputs())
+    ha.tick()
+    assert sorted(orders(conn)) == [1, 3]                  # not the current globals [1, 2, 5]
+    b, _ = _cohort(conn, base, activate=None)               # current code differs
+    drain = ha.runner()
+    assert drain.p["latencies_s"] == [1, 3]
+    ha.accepting = False
+    ha.at(10)
+    asyncio.run(drain.tick())
+    assert {k: v[0] for k, v in orders(conn).items()} == {1: "filled", 3: "filled"}

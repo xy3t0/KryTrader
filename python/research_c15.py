@@ -12,8 +12,11 @@ Durability: every order's lifecycle is in the database, not memory.
   fill txn       per scenario: simulated execution + wallet + order state;
   settle txn     per scenario wallet and market.
 A crash at any point leaves either the whole step or none of it, and the
-next run resumes from the rows (pending orders, unpriced executions,
-positions). Execution existence depends only on the order and book
+next run resumes from the rows (pending orders, unresolved or unpriced
+executions, positions). Only a valid observed book can establish "no
+liquidity": when the arrival book evidence is missing, corrupt or not
+live, the order is 'unresolved' (reservation held, scenario quarantined,
+unscored) until that evidence is recovered. Execution existence depends only on the order and book
 evidence: when fees cannot be established, the execution is kept as
 'unpriced', its reservation held and its scenario quarantined until priced.
 """
@@ -62,7 +65,7 @@ PARAMS = {
     "max_vol_age_s": 120,
     "max_candle_lag_s": 180,
     "max_metadata_age_s": 30,
-    "fill_grace_s": 1,
+    "fill_grace_s": 3,          # > liveness interval, so arrival is bracketed by marks
     "duration_days": 90,
     "fee_policy": fctx.CONDITIONAL_PAPER,
     "account_id": "research-c15",
@@ -155,7 +158,7 @@ CREATE TABLE IF NOT EXISTS rx_orders (
     arrival_at TEXT NOT NULL,
     decision_id INTEGER NOT NULL REFERENCES rx_decisions (id),
     state TEXT NOT NULL CHECK (state IN ('rejected', 'pending', 'filled', 'partial',
-                                         'no_fill', 'unpriced')),
+                                         'no_fill', 'unpriced', 'unresolved')),
     admission TEXT NOT NULL,
     fee_bound TEXT,
     net_edge TEXT,
@@ -340,20 +343,47 @@ def order_id(mid: str, latency_s: int, event_ticker: str) -> str:
 
 
 def setup_wallets(conn, mid: str) -> None:
-    fctx.register_account(conn, kalshi_env="paper", account_id=PARAMS["account_id"],
-                          precision=PARAMS["precision"], precision_source=PARAMS["precision_source"])
-    for lat in PARAMS["latencies_s"]:
+    p = cohort_params(conn, mid)
+    fctx.register_account(conn, kalshi_env="paper", account_id=p["account_id"],
+                          precision=p["precision"], precision_source=p["precision_source"])
+    for lat in p["latencies_s"]:
         try:
             rw.get_wallet(conn, wallet_id(mid, lat))
         except rw.WalletError:
-            rw.create_wallet(conn, wallet_id=wallet_id(mid, lat), account_id=PARAMS["account_id"],
-                             policy=PARAMS["fee_policy"], starting_cash=PARAMS["starting_cash"])
+            rw.create_wallet(conn, wallet_id=wallet_id(mid, lat), account_id=p["account_id"],
+                             policy=p["fee_policy"], starting_cash=p["starting_cash"])
 
 
-def outstanding(conn, mid: str) -> int:
+def runner_cohorts(conn, current_mid: str, accepting_mid: Optional[str]) -> list[str]:
+    """Every cohort that needs a runner: the accepting one, plus EVERY cohort
+    (any status, including the current manifest when suspended) that still
+    has outstanding orders or positions. Deduplicated, accepting first."""
+    out = [accepting_mid] if accepting_mid else []
+    for (mid,) in conn.execute("SELECT manifest_id FROM rx_cohorts ORDER BY created_at"):
+        if mid not in out and outstanding(conn, mid) > 0:
+            out.append(mid)
+    return out
+
+
+def cohort_params(conn, mid: str) -> dict:
+    """The parameters a cohort was frozen with (never the current globals)."""
+    r = conn.execute("SELECT body FROM rx_manifests WHERE manifest_id=?", (mid,)).fetchone()
+    if r is None:
+        raise ExperimentError(f"unknown manifest {mid[:16]}")
+    params = json.loads(r[0]).get("params")
+    if not isinstance(params, dict) or not params.get("latencies_s"):
+        raise ExperimentError(f"manifest {mid[:16]} has no usable params")
+    return params
+
+
+OPEN_STATES = ("pending", "unpriced", "unresolved")
+
+
+def outstanding(conn, mid: str, params: Optional[dict] = None) -> int:
+    params = params or cohort_params(conn, mid)
     n = conn.execute("SELECT COUNT(*) FROM rx_orders WHERE manifest_id=? AND state IN "
-                     "('pending','unpriced')", (mid,)).fetchone()[0]
-    for lat in PARAMS["latencies_s"]:
+                     "('pending','unpriced','unresolved')", (mid,)).fetchone()[0]
+    for lat in params["latencies_s"]:
         n += conn.execute("SELECT COUNT(*) FROM rw_positions WHERE wallet_id=?",
                           (wallet_id(mid, lat),)).fetchone()[0]
     return n
@@ -453,6 +483,50 @@ def validate_rules(market: dict, event: dict) -> RulesCheck:
     return RulesCheck(True, "verified", float(strike), close, sha)
 
 
+# ---- volatility input -----------------------------------------------------------
+
+class CandleError(ValueError):
+    pass
+
+
+def candle_series(rows: Any, received_at: datetime, *, window: int) -> tuple[list[float], datetime]:
+    """Validate Hyperliquid 1m candles and return (closes oldest->newest,
+    newest candle start). Policy (frozen): rows are sorted by start time;
+    exact duplicates are collapsed, conflicting duplicates are rejected; any
+    malformed row, a start time after receipt, or a missing minute inside
+    the last window+1 candles rejects the whole series. The newest candle
+    may be the one still in progress at receipt (its close is the latest
+    price at that moment, so it is causal); this matches the baseline."""
+    if not isinstance(rows, list) or not rows:
+        raise CandleError("no candles")
+    recv_ms = int(received_at.timestamp() * 1000)
+    by_t: dict[int, float] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            raise CandleError("malformed row")
+        t = r.get("t")
+        if isinstance(t, bool) or not isinstance(t, int) or t % 60_000:
+            raise CandleError(f"bad start time {t!r}")
+        try:
+            c = float(Decimal(str(r.get("c"))))
+        except Exception as e:
+            raise CandleError(f"bad close {r.get('c')!r}") from e
+        if not math.isfinite(c) or c <= 0:
+            raise CandleError(f"bad close {r.get('c')!r}")
+        if t > recv_ms:
+            raise CandleError("candle starts after it was received")
+        if t in by_t and by_t[t] != c:
+            raise CandleError(f"conflicting duplicate candle at {t}")
+        by_t[t] = c
+    starts = sorted(by_t)
+    tail = starts[-(window + 1):]
+    if len(tail) < window + 1:
+        raise CandleError("not enough candles")
+    if any(b - a != 60_000 for a, b in zip(tail, tail[1:])):
+        raise CandleError("missing minute inside the volatility window")
+    return [by_t[t] for t in starts], datetime.fromtimestamp(starts[-1] / 1000, timezone.utc)
+
+
 # ---- decision ---------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -527,6 +601,8 @@ def decide(inp: MarketInputs, book: Optional[sim_exec.BookState], *, open_positi
         return Decision(False, "stale_spot")
     if inp.sigma_1m is None or inp.candles_received_at is None or inp.newest_candle_start is None:
         return Decision(False, "missing_volatility")
+    if inp.newest_candle_start > inp.candles_received_at or inp.newest_candle_start > d:
+        return Decision(False, "input_from_future:candle_start")
     if (d - inp.candles_received_at).total_seconds() > p["max_vol_age_s"] or \
             (inp.candles_received_at - inp.newest_candle_start).total_seconds() > p["max_candle_lag_s"]:
         return Decision(False, "stale_volatility")
@@ -563,8 +639,13 @@ class C15Runner:
                  prepare_fees: Callable[..., Awaitable[FeesPrepared]],
                  rebuild_fee: Callable[[dict, datetime], fctx.FeeContext],
                  result_for: Callable[[str], Awaitable[tuple[Optional[str], tuple]]],
-                 clock: Callable[[], datetime]):
+                 clock: Callable[[], datetime],
+                 params: Optional[dict] = None,
+                 evidence_barrier: Callable[[str], None] = lambda ticker: None):
         self.conn, self.mid = conn, mid
+        # A cohort always runs with the parameters it was frozen with.
+        self.p = params or cohort_params(conn, mid)
+        self.evidence_barrier = evidence_barrier
         self.accepting, self.inputs, self.tape_for = accepting, inputs, tape_for
         self.prepare_fees, self.rebuild_fee = prepare_fees, rebuild_fee
         self.result_for, self.clock = result_for, clock
@@ -581,12 +662,13 @@ class C15Runner:
 
     def _scenario_busy(self, lat: int) -> int:
         n = self.conn.execute("SELECT COUNT(*) FROM rx_orders WHERE manifest_id=? AND latency_s=? "
-                              "AND state IN ('pending','unpriced')", (self.mid, lat)).fetchone()[0]
+                              "AND state IN ('pending','unpriced','unresolved')", (self.mid, lat)).fetchone()[0]
         return n + self.conn.execute("SELECT COUNT(*) FROM rw_positions WHERE wallet_id=?",
                                      (wallet_id(self.mid, lat),)).fetchone()[0]
 
     async def tick(self) -> None:
         self.process_pending()
+        self.retry_unresolved()
         self.retry_unpriced()
         await self.settle_due()
         await self.record_outcomes()
@@ -598,7 +680,7 @@ class C15Runner:
         inp = await self.inputs()
         if inp is None:
             return
-        primary = PARAMS["primary_latency_s"]
+        primary = self.p["primary_latency_s"]
         tape = self.tape_for(inp.market_ticker, inp.decided_at)
         book = tape.state_at(inp.decided_at) if tape else None
         attempted = self.conn.execute("SELECT 1 FROM rx_attempts WHERE manifest_id=? AND "
@@ -609,7 +691,7 @@ class C15Runner:
             return
         prepared = None
         if d.eligible:
-            arrivals = {lat: inp.decided_at + timedelta(seconds=lat) for lat in PARAMS["latencies_s"]}
+            arrivals = {lat: inp.decided_at + timedelta(seconds=lat) for lat in self.p["latencies_s"]}
             prepared = await self.prepare_fees(market_ticker=inp.market_ticker,
                                                decided_at=inp.decided_at, arrivals=arrivals)
         self._begin()
@@ -629,6 +711,7 @@ class C15Runner:
                 self.conn.execute("INSERT INTO rx_attempts VALUES (?,?,?,?)",
                                   (self.mid, inp.event_ticker, inp.market_ticker, did))
                 self._admit_all(inp, d, did, prepared)
+            self.evidence_barrier(inp.market_ticker)     # book evidence durable first
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
@@ -637,29 +720,29 @@ class C15Runner:
     def _admit_all(self, inp: MarketInputs, d: Decision, did: int, prepared: FeesPrepared) -> None:
         ctx0, arrival_ctx, evidence = prepared
         now = _iso(self.clock())
-        for lat in PARAMS["latencies_s"]:
+        for lat in self.p["latencies_s"]:
             oid = order_id(self.mid, lat, inp.event_ticker)
             arrival = inp.decided_at + timedelta(seconds=lat)
             row = dict(manifest_id=self.mid, event_ticker=inp.event_ticker, latency_s=lat,
                        order_id=oid, wallet_id=wallet_id(self.mid, lat),
                        market_ticker=inp.market_ticker, side=d.side, limit_price=d.limit,
-                       count=PARAMS["contracts_per_entry"], decided_at=_iso(inp.decided_at),
+                       count=self.p["contracts_per_entry"], decided_at=_iso(inp.decided_at),
                        arrival_at=_iso(arrival), decision_id=did, fee_evidence=json.dumps(evidence),
                        updated_at=now)
             if self._quarantined(lat):
                 self._insert_order(row, "rejected", "scenario_quarantined")
                 continue
-            if self._scenario_busy(lat) >= PARAMS["max_open_positions"]:
+            if self._scenario_busy(lat) >= self.p["max_open_positions"]:
                 self._insert_order(row, "rejected", "scenario_position_limit")
                 continue
             adm = gate.admit(self.conn, gate.ExecutionIntent(
                 wallet_id=row["wallet_id"], order_id=oid, ticker=inp.market_ticker, side=d.side,
                 action="buy", order_type="ioc", role="taker", limit=d.limit,
-                count=PARAMS["contracts_per_entry"], side_probability=d.probability,
+                count=self.p["contracts_per_entry"], side_probability=d.probability,
                 decided_at=inp.decided_at, fee_context=ctx0,
                 fee_envelope=(arrival_ctx[lat],)),
-                min_net_edge_per_contract=PARAMS["min_net_edge_per_contract"],
-                max_limit=PARAMS["max_limit"], policy=PARAMS["fee_policy"])
+                min_net_edge_per_contract=self.p["min_net_edge_per_contract"],
+                max_limit=self.p["max_limit"], policy=self.p["fee_policy"])
             row.update(fee_bound=None if adm.fee_bound is None else str(adm.fee_bound),
                        net_edge=None if adm.net_edge_per_contract is None
                        else str(adm.net_edge_per_contract),
@@ -674,7 +757,7 @@ class C15Runner:
 
     # -- execution
     def process_pending(self) -> None:
-        grace = timedelta(seconds=PARAMS["fill_grace_s"])
+        grace = timedelta(seconds=self.p["fill_grace_s"])
         now = self.clock()
         rows = self.conn.execute(
             "SELECT event_ticker, latency_s FROM rx_orders WHERE manifest_id=? AND state='pending' "
@@ -735,29 +818,37 @@ class C15Runner:
         if cur.rowcount != 1:
             raise ExperimentError(f"order {o['order_id']} not in state {from_state}")
 
-    def _execute(self, o: dict) -> None:
+    def _execute(self, o: dict, from_state: str = "pending") -> None:
         arrival = _dt(o["arrival_at"])
         try:
             ctx = self.rebuild_fee(json.loads(o["fee_evidence"]), arrival)
         except Exception as e:
-            ctx = fctx.FeeContext("paper", PARAMS["account_id"], None, Decimal(0), "",
-                                  PARAMS["fee_policy"], None, (), None, False, f"rebuild_failed:{e}")
+            ctx = fctx.FeeContext("paper", self.p["account_id"], None, Decimal(0), "",
+                                  self.p["fee_policy"], None, (), None, False, f"rebuild_failed:{e}")
         self._begin()
         try:
             sim = self._simulate(o)
             fills = [[_dec(f.price), _dec(f.count)] for f in sim.fills]
+            if sim.reason == "book_unavailable":
+                # No valid observed book at arrival: execution unknowable. Hold.
+                if from_state == "pending":
+                    self._set_state(o, from_state, state="unresolved", sim_reason=sim.reason)
+                    self._quarantine(o, "arrival book evidence unavailable")
+                self.conn.commit()
+                return
             if not fills:
                 rw.release(self.conn, wallet_id=o["wallet_id"], order_id=o["order_id"], at=arrival)
-                self._set_state(o, "pending", state="no_fill", sim_reason=sim.reason, fills="[]")
+                self._set_state(o, from_state, state="no_fill", sim_reason=sim.reason, fills="[]")
             else:
                 if not ctx.usable:
                     raise _Unpriced(f"fee context: {ctx.reason}")
                 before = rw.get_wallet(self.conn, o["wallet_id"]).cash
                 filled = self._apply_fills(o, fills, ctx)
                 state = "filled" if filled == Fraction(Decimal(o["count"])) else "partial"
-                self._set_state(o, "pending", state=state, sim_reason=sim.reason,
-                                fills=json.dumps(fills),
-                                envelope_breach=self._breach(o, before))
+                self._set_state(o, from_state, state=state, sim_reason=sim.reason,
+                                fills=json.dumps(fills), envelope_breach=self._breach(o, before))
+            self._lift_quarantine_if_clear(o["latency_s"])
+            self.evidence_barrier(o["market_ticker"])
             self.conn.commit()
             return
         except (_Unpriced, rw.WalletError) as e:
@@ -770,15 +861,34 @@ class C15Runner:
         self._begin()
         try:
             sim = self._simulate(o)          # deterministic; re-consumes the same liquidity
-            self._set_state(o, "pending", state="unpriced", sim_reason=sim.reason,
+            self._set_state(o, from_state, state="unpriced", sim_reason=sim.reason,
                             fills=self._fills_json(sim))
-            self.conn.execute("INSERT OR IGNORE INTO rx_quarantine VALUES (?,?,?,?)",
-                              (self.mid, o["latency_s"], f"unpriced {o['order_id']}: {reason}"[:300],
-                               _iso(self.clock())))
+            self._quarantine(o, f"unpriced: {reason}")
+            self.evidence_barrier(o["market_ticker"])
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
             raise
+
+    def _quarantine(self, o: dict, reason: str) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO rx_quarantine VALUES (?,?,?,?)",
+                          (self.mid, o["latency_s"], f"{o['order_id']}: {reason}"[:300],
+                           _iso(self.clock())))
+
+    def _lift_quarantine_if_clear(self, lat: int) -> None:
+        left = self.conn.execute("SELECT COUNT(*) FROM rx_orders WHERE manifest_id=? AND latency_s=? "
+                                 "AND state IN ('unpriced','unresolved')", (self.mid, lat)).fetchone()[0]
+        if not left:
+            self.conn.execute("DELETE FROM rx_quarantine WHERE manifest_id=? AND latency_s=?",
+                              (self.mid, lat))
+
+    def retry_unresolved(self) -> None:
+        """Re-examine executions whose arrival book was unavailable; resolve
+        them only if valid arrival evidence has since become available."""
+        rows = self.conn.execute("SELECT event_ticker, latency_s FROM rx_orders WHERE "
+                                 "manifest_id=? AND state='unresolved'", (self.mid,)).fetchall()
+        for event, lat in rows:
+            self._execute(self._order(event, lat), from_state="unresolved")
 
     def retry_unpriced(self) -> None:
         rows = self.conn.execute("SELECT event_ticker, latency_s FROM rx_orders WHERE "
@@ -807,11 +917,7 @@ class C15Runner:
             state = "filled" if filled == Fraction(Decimal(o["count"])) else "partial"
             self._set_state(o, "unpriced", state=state, priced_late=1,
                             envelope_breach=self._breach(o, before))
-            left = self.conn.execute("SELECT COUNT(*) FROM rx_orders WHERE manifest_id=? AND "
-                                     "latency_s=? AND state='unpriced'", (self.mid, lat)).fetchone()[0]
-            if not left:
-                self.conn.execute("DELETE FROM rx_quarantine WHERE manifest_id=? AND latency_s=?",
-                                  (self.mid, lat))
+            self._lift_quarantine_if_clear(lat)
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
@@ -820,7 +926,7 @@ class C15Runner:
     # -- settlement and outcomes
     async def settle_due(self) -> None:
         results: dict = {}
-        for lat in PARAMS["latencies_s"]:
+        for lat in self.p["latencies_s"]:
             wid = wallet_id(self.mid, lat)
             for (ticker,) in self.conn.execute("SELECT DISTINCT ticker FROM rw_positions WHERE "
                                                "wallet_id=?", (wid,)).fetchall():
