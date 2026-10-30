@@ -279,3 +279,92 @@ def test_restart_replay_continues_with_new_generation(tmp_path):
 def test_recorder_rejects_bad_names(tmp_path, name):
     with pytest.raises(sx.SimError):
         sx.BookRecorder(tmp_path, name)
+
+
+# ---- shared subscription (Kalshi: one orderbook sid, seq shared by markets) ----------
+
+def stream(*events, until=12):
+    return sx.BookStream.from_events(with_alive([up()] + list(events), until))
+
+
+def test_interleaved_markets_on_one_sid_are_valid():
+    st = stream(snap(1, no=[("0.04", "1.00")]), snap(2, no=[("0.30", "2.00")], s=0.1, ticker=TK2),
+                delta(3, "no", "0.04", "1.00", 0.2), delta(4, "no", "0.30", "1.00", 0.3, ticker=TK2))
+    t = T0 + timedelta(seconds=1)
+    assert st.state_at(TK, t).no == ((F(4, 100), F(2)),)
+    assert st.state_at(TK2, t).no == ((F(30, 100), F(3)),)
+
+
+def test_gap_on_shared_sid_invalidates_every_market_until_resnapshot():
+    st = stream(snap(1, no=[("0.04", "1.00")]), snap(2, no=[("0.30", "2.00")], s=0.1, ticker=TK2),
+                delta(5, "no", "0.30", "1.00", 0.2, ticker=TK2))          # 3, 4 missing
+    t = T0 + timedelta(seconds=1)
+    assert st.state_at(TK, t) is None and st.state_at(TK2, t) is None
+    assert sorted(st.needs_snapshot([TK, TK2])) == sorted([TK, TK2])
+    st.feed(snap(6, no=[("0.04", "1.00")], s=12.1))                       # get_snapshot reply
+    assert st.state_at(TK, T0 + timedelta(seconds=12.2)) is not None
+    assert st.needs_snapshot([TK, TK2]) == [TK2]
+
+
+def test_removing_one_market_keeps_the_others():
+    st = stream(snap(1, no=[("0.04", "1.00")]), snap(2, no=[("0.30", "2.00")], s=0.1, ticker=TK2),
+                {"t": at(0.5), "kind": "invalidate", "ticker": TK2, "reason": "delete_markets"},
+                delta(3, "no", "0.04", "1.00", 0.6))
+    t = T0 + timedelta(seconds=1)
+    assert st.state_at(TK2, t) is None and st.state_at(TK, t).no == ((F(4, 100), F(2)),)
+
+
+def test_market_added_after_connection_up_becomes_usable():
+    # Codex repro: socket up -> track -> snapshot -> alive used to return None.
+    events = with_alive([up(-10), snap(1, no=[("0.30", "1.00")], s=-9, ticker=TK2),
+                         snap(2, no=[("0.04", "1.00")], s=3)], until=12)
+    st = sx.BookStream.from_events(sorted(events, key=lambda e: (e["t"], e["kind"] != "up")))
+    assert st.state_at(TK, T0 + timedelta(seconds=4)) is not None
+
+
+def test_attach_header_replays_mid_stream_recording():
+    # A recording that starts while the stream is at seq 41 on sid 7.
+    events = [{"t": at(0), "kind": "attach", "gen": 1, "connected": True, "seqs": {"7": 41}},
+              snap(42, no=[("0.04", "1.00")], s=0.1), delta(43, "no", "0.04", "1.00", 0.2)]
+    st = sx.BookStream.from_events(with_alive(events, until=3)[1:] if False else
+                                   sorted(events + [alive(k * 0.5) for k in range(1, 7)],
+                                          key=lambda e: e["t"]))
+    assert st.state_at(TK, T0 + timedelta(seconds=1)).no == ((F(4, 100), F(2)),)
+    bad = [{"t": at(0), "kind": "attach", "gen": 1, "connected": True, "seqs": {"7": 41}},
+           snap(42, no=[("0.04", "1.00")], s=0.1), delta(45, "no", "0.04", "1.00", 0.2)]
+    st2 = sx.BookStream.from_events(sorted(bad + [alive(k * 0.5) for k in range(1, 7)],
+                                           key=lambda e: e["t"]))
+    assert st2.state_at(TK, T0 + timedelta(seconds=1)) is None        # gap after attach
+
+
+def test_attach_invalidates_books_from_before_it():
+    events = with_alive([up(), snap(1, no=[("0.04", "1.00")])], until=2)
+    events += [{"t": at(2.5), "kind": "attach", "gen": 9, "connected": True, "seqs": {}}]
+    events += [alive(3 + k * 0.5, gen=9) for k in range(6)]
+    st = sx.BookStream.from_events(events)
+    assert st.state_at(TK, T0 + timedelta(seconds=4)) is None
+
+
+def test_recorder_sync_marks_durable_watermark(tmp_path):
+    rec = sx.BookRecorder(tmp_path, "w")
+    rec.write(up())
+    assert rec.synced is None
+    rec.sync()
+    assert rec.synced == up()["t"]
+    rec.close()
+
+
+def test_execution_needs_evidence_past_arrival():
+    events = with_alive([up(), snap(1, no=[("0.04", "1.00")])], until=0.5)
+    tp = sx.BookTape.from_events(TK, events)
+    assert tp.state_at(T0 + timedelta(seconds=1)) is not None                 # decision view
+    assert tp.state_at(T0 + timedelta(seconds=1), confirmed=True) is None     # recording ends
+    tp.feed(alive(1.5))
+    assert tp.state_at(T0 + timedelta(seconds=1), confirmed=True) is not None
+
+
+def test_confirmation_fails_if_connection_dropped_before_next_mark():
+    events = with_alive([up(), snap(1, no=[("0.04", "1.00")])], until=0.5)
+    events += [down(1.2), up(1.3, gen=2), alive(1.5, gen=2)]
+    tp = sx.BookTape.from_events(TK, events)
+    assert tp.state_at(T0 + timedelta(seconds=1), confirmed=True) is None

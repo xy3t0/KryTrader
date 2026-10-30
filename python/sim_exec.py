@@ -86,51 +86,83 @@ def _int(v: Any) -> Optional[int]:
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
-class BookTape:
-    """Exact, time-indexed book for one market, fed by EVENTS:
+class _Market:
+    __slots__ = ("yes", "no", "valid", "sid", "gen", "times", "states")
 
-      {"t": iso, "kind": "up"|"down", "gen": n}          connection state
-      {"t": iso, "kind": "alive", "gen": n}               liveness mark (~1/s)
-      {"t": iso, "kind": "msg", "gen": n, "raw": str}     raw websocket text
-      {"t": iso, "kind": "invalidate", "reason": str}     e.g. listener failure
+    def __init__(self):
+        self.yes: dict = {}
+        self.no: dict = {}
+        self.valid = False
+        self.sid: Optional[int] = None
+        self.gen: Optional[int] = None
+        self.times: list = []
+        self.states: list = []
 
-    The same events are what BookRecorder persists, so a tape rebuilt from
-    disk (from_events) is identical to the live one.
 
-    state_at(t) returns a book only if: the latest state at or before t is
-    valid; the connection generation that produced it is still up at t; and
-    a liveness mark for that generation is no older than MAX_SILENCE at t.
-    Sequence gaps, sid changes, malformed or impossible messages, a new
-    generation without a fresh snapshot, and explicit invalidations all make
-    the book unusable until the next snapshot.
+class BookStream:
+    """Exact order books for every market on one websocket stream.
+
+    Kalshi carries orderbook updates on a subscription whose `seq` is shared
+    by all of its markets, so continuity is checked PER SUBSCRIPTION (sid):
+    a gap invalidates every market bound to that sid until each gets a fresh
+    snapshot; interleaved markets on one sid are normal. Events:
+
+      {"kind": "attach", "gen": g, "connected": bool, "seqs": {sid: seq}}
+          a recording starts mid-stream: known stream position, unknown books
+      {"kind": "up"/"down", "gen": g}      connection generation
+      {"kind": "alive", "gen": g}          an answered ping
+      {"kind": "msg", "gen": g, "raw": s}  raw orderbook text
+      {"kind": "invalidate", "ticker": t?} one market (or all) unusable
+
+    state_at(ticker, t) returns a book only if that market's latest state is
+    valid, its generation is up at t, and a liveness mark for that
+    generation is no older than MAX_SILENCE.
     """
 
-    def __init__(self, ticker: str, *, horizon: Optional[timedelta] = None):
-        self.ticker = ticker
-        self.horizon = horizon
-        self._yes: dict[Fraction, Fraction] = {}
-        self._no: dict[Fraction, Fraction] = {}
-        self._seq: Optional[int] = None
-        self._sid: Optional[int] = None
-        self._valid = False
-        self._gen: Optional[int] = None          # generation currently up, else None
-        self._book_gen: Optional[int] = None     # generation the book was built on
+    def __init__(self):
+        self._gen: Optional[int] = None
+        self._seq: dict[int, int] = {}
+        self.markets: dict[str, _Market] = {}
         self._last_t: Optional[datetime] = None
-        self._times: list = []
-        self._states: list = []
         self._conn_times: list = []
-        self._conn: list = []                    # (state, gen)
+        self._conn: list = []
         self._alive_times: list = []
         self._alive_gens: list = []
 
-    # ---- input -----------------------------------------------------------------
-
     @classmethod
-    def from_events(cls, ticker: str, events) -> "BookTape":
-        tape = cls(ticker)
+    def from_events(cls, events) -> "BookStream":
+        st = cls()
         for ev in events:
-            tape.feed(ev)
-        return tape
+            st.feed(ev)
+        return st
+
+    @property
+    def generation(self) -> Optional[int]:
+        return self._gen
+
+    def position(self) -> dict:
+        """What an attach header must carry to replay from here."""
+        return {"gen": self._gen, "connected": self._gen is not None,
+                "seqs": {str(k): v for k, v in self._seq.items()}}
+
+    def _m(self, ticker: str) -> _Market:
+        m = self.markets.get(ticker)
+        if m is None:
+            m = self.markets[ticker] = _Market()
+        return m
+
+    def _record(self, ticker: str, t: datetime) -> None:
+        m = self._m(ticker)
+        m.times.append(t)
+        m.states.append(BookState(tuple(sorted(m.yes.items())), tuple(sorted(m.no.items())),
+                                  0, m.sid, m.gen, t, m.valid))
+
+    def _invalidate(self, t: datetime, tickers=None) -> None:
+        for tk in (self.markets if tickers is None else tickers):
+            m = self._m(tk)
+            if m.valid or not m.times:
+                m.valid = False
+                self._record(tk, t)
 
     def feed(self, ev: dict) -> None:
         t = _aware(datetime.fromisoformat(ev["t"]))
@@ -139,53 +171,59 @@ class BookTape:
         self._last_t = t
         kind = ev.get("kind")
         gen = _int(ev.get("gen"))
-        if kind == "up":
-            self._gen = gen
+        if kind == "attach":
+            self._seq = {int(k): v for k, v in (ev.get("seqs") or {}).items()
+                         if str(k).lstrip("-").isdigit() and _int(v) is not None}
+            self._gen = gen if ev.get("connected") else None
             self._conn_times.append(t)
-            self._conn.append(("up", gen))
-            self._invalidate(t)                  # a new connection needs a fresh snapshot
-        elif kind == "down":
-            self._gen = None
+            self._conn.append(("up" if self._gen is not None else "down", gen))
+            self._invalidate(t)
+        elif kind in ("up", "down"):
+            self._gen = gen if kind == "up" else None
+            self._seq = {}
             self._conn_times.append(t)
-            self._conn.append(("down", gen))
+            self._conn.append((kind, gen))
             self._invalidate(t)
         elif kind == "alive":
             self._alive_times.append(t)
             self._alive_gens.append(gen)
         elif kind == "invalidate":
-            self._invalidate(t)
+            tk = ev.get("ticker")
+            self._invalidate(t, None if tk is None else [tk])
         elif kind == "msg":
             self._apply_raw(ev.get("raw"), gen, t)
         else:
             raise SimError(f"unknown book event kind {kind!r}")
-        self._trim(t)
-
-    def _invalidate(self, t: datetime) -> None:
-        self._valid = False
-        self._record(t)
 
     def _apply_raw(self, raw: Any, gen: Optional[int], t: datetime) -> None:
         import json
+        from decimal import Decimal
         try:
-            m = json.loads(raw, parse_float=__import__("decimal").Decimal)
+            m = json.loads(raw, parse_float=Decimal)
         except (TypeError, ValueError):
-            self._invalidate(t)
+            self._invalidate(t)          # cannot tell which market: distrust all
             return
-        if not isinstance(m, dict):
-            self._invalidate(t)
+        if not isinstance(m, dict) or m.get("type") not in ("orderbook_snapshot", "orderbook_delta"):
             return
         msg = m.get("msg") if isinstance(m.get("msg"), dict) else {}
-        kind = m.get("type")
-        if kind not in ("orderbook_snapshot", "orderbook_delta"):
+        ticker = msg.get("market_ticker")
+        sid, seq = _int(m.get("sid")), _int(m.get("seq"))
+        if not isinstance(ticker, str) or not ticker:
+            self._invalidate(t)
             return
-        if msg.get("market_ticker") != self.ticker:
+        if gen is None or gen != self._gen or sid is None or seq is None:
+            self._invalidate(t, [ticker])
             return
-        seq, sid = _int(m.get("seq")), _int(m.get("sid"))
-        if gen is None or gen != self._gen or seq is None:
-            self._invalidate(t)                  # stale generation or malformed
-            return
+        expected = self._seq.get(sid)
+        if expected is not None and seq <= expected:
+            return                                   # duplicate / replayed
+        gap = expected is not None and seq != expected + 1
+        self._seq[sid] = seq
+        if gap:
+            self._invalidate(t, [tk for tk, mk in self.markets.items() if mk.sid == sid])
+        mk = self._m(ticker)
         try:
-            if kind == "orderbook_snapshot":
+            if m["type"] == "orderbook_snapshot":
                 yes, no = {}, {}
                 for side, key in ((yes, "yes_dollars_fp"), (no, "no_dollars_fp")):
                     levels = msg.get(key) or []
@@ -199,26 +237,18 @@ class BookTape:
                             raise SimError("impossible level")
                         if sz > 0:
                             side[p] = sz
-                self._yes, self._no = yes, no
-                self._seq, self._sid, self._book_gen, self._valid = seq, sid, gen, True
+                mk.yes, mk.no, mk.sid, mk.gen, mk.valid = yes, no, sid, gen, True
             else:
-                if not self._valid or sid != self._sid or self._book_gen != gen:
-                    self._invalidate(t)
+                if gap or not mk.valid or mk.sid != sid or mk.gen != gen:
+                    self._invalidate(t, [ticker])
                     return
-                if seq <= self._seq:
-                    return                       # duplicate / stale
-                if seq != self._seq + 1:
-                    self._seq = seq
-                    self._invalidate(t)          # gap
-                    return
-                book = {"yes": self._yes, "no": self._no}.get(msg.get("side"))
+                book = {"yes": mk.yes, "no": mk.no}.get(msg.get("side"))
                 if book is None:
                     raise SimError("bad side")
                 p = _f(msg.get("price_dollars"), "price")
                 if not (0 < p < 1):
                     raise SimError("impossible price")
                 new = book.get(p, Fraction(0)) + _f(msg.get("delta_fp"), "delta")
-                self._seq = seq
                 if new < 0:
                     raise SimError("negative level")
                 if new == 0:
@@ -226,49 +256,26 @@ class BookTape:
                 else:
                     book[p] = new
         except (SimError, TypeError, IndexError):
-            self._invalidate(t)
+            mk.valid = False
+            self._record(ticker, t)
             return
-        self._record(t)
-
-    def _record(self, t: datetime) -> None:
-        self._times.append(t)
-        self._states.append(BookState(tuple(sorted(self._yes.items())),
-                                      tuple(sorted(self._no.items())), self._seq or 0,
-                                      self._sid, self._book_gen, t, self._valid))
-
-    def _trim(self, now: datetime) -> None:
-        if self.horizon is None:
-            return
-        cut = now - self.horizon
-        for times, *vals in ((self._times, self._states), (self._alive_times, self._alive_gens)):
-            k = bisect.bisect_left(times, cut)
-            if k > 1:
-                del times[:k - 1]
-                for v in vals:
-                    del v[:k - 1]
+        self._record(ticker, t)
 
     # ---- queries ---------------------------------------------------------------
 
-    def level_absent_between(self, book_side: str, price: Fraction, t0: datetime,
-                             t1: datetime) -> bool:
-        """True if any recorded VALID state in (t0, t1] lacked this level. If
-        history does not reach back to t0, returns False (consumption kept)."""
-        if not self._times or self._times[0] > t0:
-            return False
-        i = bisect.bisect_right(self._times, t0)
-        j = bisect.bisect_right(self._times, t1)
-        for k in range(i, j):
-            st = self._states[k]
-            if st.valid and price not in dict(st.yes if book_side == "yes" else st.no):
-                return True
-        return False
-
-    def state_at(self, t: datetime) -> Optional[BookState]:
+    def state_at(self, ticker: str, t: datetime, *, confirmed: bool = False) -> Optional[BookState]:
+        """confirmed=True additionally requires a liveness mark of the same
+        generation in [t, t + MAX_SILENCE]: proof the stream (and its
+        recording) continued past t, so no message received by t is missing.
+        Executions use it; a decision taken "now" cannot."""
         t = _aware(t)
-        i = bisect.bisect_right(self._times, t)
+        mk = self.markets.get(ticker)
+        if mk is None:
+            return None
+        i = bisect.bisect_right(mk.times, t)
         if i == 0:
             return None
-        st = self._states[i - 1]
+        st = mk.states[i - 1]
         if not st.valid or st.generation is None:
             return None
         c = bisect.bisect_right(self._conn_times, t)
@@ -279,7 +286,61 @@ class BookTape:
             a -= 1
         if a == 0 or t - self._alive_times[a - 1] > MAX_SILENCE:
             return None
+        if confirmed:
+            b = bisect.bisect_left(self._alive_times, t)
+            while b < len(self._alive_times) and self._alive_gens[b] != st.generation:
+                b += 1
+            if b == len(self._alive_times) or self._alive_times[b] - t > MAX_SILENCE:
+                return None
+            # and the generation must not have gone down in between
+            c2 = bisect.bisect_right(self._conn_times, self._alive_times[b])
+            if self._conn[c2 - 1] != ("up", st.generation):
+                return None
         return st
+
+    def level_absent_between(self, ticker: str, book_side: str, price: Fraction,
+                             t0: datetime, t1: datetime) -> bool:
+        mk = self.markets.get(ticker)
+        if mk is None or not mk.times or mk.times[0] > t0:
+            return False
+        i = bisect.bisect_right(mk.times, t0)
+        j = bisect.bisect_right(mk.times, t1)
+        for k in range(i, j):
+            st = mk.states[k]
+            if st.valid and price not in dict(st.yes if book_side == "yes" else st.no):
+                return True
+        return False
+
+    def needs_snapshot(self, tickers) -> list:
+        """Tracked markets with no valid book while the stream is connected."""
+        if self._gen is None:
+            return []
+        return [tk for tk in tickers if not (self.markets.get(tk) and self.markets[tk].valid)]
+
+    def view(self, ticker: str) -> "BookTape":
+        return BookTape(ticker, stream=self)
+
+
+class BookTape:
+    """One market's view of a BookStream (what the simulator consumes)."""
+
+    def __init__(self, ticker: str, *, stream: Optional[BookStream] = None):
+        self.ticker = ticker
+        self.stream = stream or BookStream()
+
+    @classmethod
+    def from_events(cls, ticker: str, events) -> "BookTape":
+        return cls(ticker, stream=BookStream.from_events(events))
+
+    def feed(self, ev: dict) -> None:
+        self.stream.feed(ev)
+
+    def state_at(self, t: datetime, *, confirmed: bool = False) -> Optional[BookState]:
+        return self.stream.state_at(self.ticker, t, confirmed=confirmed)
+
+    def level_absent_between(self, book_side: str, price: Fraction, t0: datetime,
+                             t1: datetime) -> bool:
+        return self.stream.level_absent_between(self.ticker, book_side, price, t0, t1)
 
 
 class BookRecorder:
@@ -301,11 +362,23 @@ class BookRecorder:
                 with open(self.path, "r+b") as f:
                     f.truncate(cut)
         self._fh = open(self.path, "a", encoding="utf-8")
+        self.last_written: Optional[str] = None
+        self.synced: Optional[str] = None
 
     def write(self, ev: dict) -> None:
         import json
         self._fh.write(json.dumps(ev, sort_keys=True, separators=(",", ":")) + "\n")
         self._fh.flush()
+        self.last_written = ev.get("t")
+
+    def sync(self) -> None:
+        """Make everything written so far durable (call before committing
+        records that depend on this evidence)."""
+        import os
+        if not self._fh.closed:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self.synced = self.last_written
 
     def finalize(self) -> tuple[str, str]:
         """Close, gzip, fsync; returns (path, sha256 of the .gz)."""
@@ -426,7 +499,7 @@ def simulate_ioc_buy(tape: BookTape, ledger: LiquidityLedger, *, side: str, limi
     if not isinstance(latency, timedelta) or latency < timedelta(0):
         raise SimError("latency must be a non-negative timedelta")
     arrival = _aware(decided_at) + latency
-    st = tape.state_at(arrival)
+    st = tape.state_at(arrival, confirmed=True)   # evidence must extend past arrival
     if st is None:
         return SimResult(arrival, (), qty, "book_unavailable")
     # Buying `side` lifts the opposite side's bids: ask = 1 - opposite bid.
