@@ -67,107 +67,290 @@ def _aware(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+MAX_SILENCE = timedelta(seconds=5)   # a liveness mark must be at least this recent
+
+
 @dataclass(frozen=True)
 class BookState:
-    """Bids on each side: {price: size}, exact. valid=False after a seq gap."""
+    """Bids on each side, exact. Only valid states are ever returned."""
     yes: tuple[tuple[Fraction, Fraction], ...]
     no: tuple[tuple[Fraction, Fraction], ...]
     seq: int
+    sid: Optional[int]
+    generation: Optional[int]
     received_at: datetime
     valid: bool
 
 
-class BookTape:
-    """Exact time-indexed book for one market. Keeps `horizon` of history."""
+def _int(v: Any) -> Optional[int]:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
 
-    def __init__(self, ticker: str, *, horizon: timedelta = timedelta(minutes=3)):
+
+class BookTape:
+    """Exact, time-indexed book for one market, fed by EVENTS:
+
+      {"t": iso, "kind": "up"|"down", "gen": n}          connection state
+      {"t": iso, "kind": "alive", "gen": n}               liveness mark (~1/s)
+      {"t": iso, "kind": "msg", "gen": n, "raw": str}     raw websocket text
+      {"t": iso, "kind": "invalidate", "reason": str}     e.g. listener failure
+
+    The same events are what BookRecorder persists, so a tape rebuilt from
+    disk (from_events) is identical to the live one.
+
+    state_at(t) returns a book only if: the latest state at or before t is
+    valid; the connection generation that produced it is still up at t; and
+    a liveness mark for that generation is no older than MAX_SILENCE at t.
+    Sequence gaps, sid changes, malformed or impossible messages, a new
+    generation without a fresh snapshot, and explicit invalidations all make
+    the book unusable until the next snapshot.
+    """
+
+    def __init__(self, ticker: str, *, horizon: Optional[timedelta] = None):
         self.ticker = ticker
         self.horizon = horizon
         self._yes: dict[Fraction, Fraction] = {}
         self._no: dict[Fraction, Fraction] = {}
         self._seq: Optional[int] = None
+        self._sid: Optional[int] = None
         self._valid = False
-        self._times: deque = deque()
-        self._states: deque = deque()
+        self._gen: Optional[int] = None          # generation currently up, else None
+        self._book_gen: Optional[int] = None     # generation the book was built on
+        self._last_t: Optional[datetime] = None
+        self._times: list = []
+        self._states: list = []
+        self._conn_times: list = []
+        self._conn: list = []                    # (state, gen)
+        self._alive_times: list = []
+        self._alive_gens: list = []
 
-    def _record(self, received_at: datetime) -> None:
-        if self._times and received_at < self._times[-1]:
-            raise SimError("book messages must arrive in receipt-time order")
-        st = BookState(tuple(sorted(self._yes.items())), tuple(sorted(self._no.items())),
-                       self._seq or 0, received_at, self._valid)
-        self._times.append(received_at)
-        self._states.append(st)
-        while self._times and self._times[0] < received_at - self.horizon:
-            self._times.popleft()
-            self._states.popleft()
+    # ---- input -----------------------------------------------------------------
 
-    def apply(self, message: dict, received_at: datetime) -> None:
-        """Apply one raw websocket message (orderbook_snapshot/orderbook_delta)."""
-        received_at = _aware(received_at)
-        kind = message.get("type")
-        msg = message.get("msg") or {}
+    @classmethod
+    def from_events(cls, ticker: str, events) -> "BookTape":
+        tape = cls(ticker)
+        for ev in events:
+            tape.feed(ev)
+        return tape
+
+    def feed(self, ev: dict) -> None:
+        t = _aware(datetime.fromisoformat(ev["t"]))
+        if self._last_t is not None and t < self._last_t:
+            raise SimError("book events must be fed in receipt-time order")
+        self._last_t = t
+        kind = ev.get("kind")
+        gen = _int(ev.get("gen"))
+        if kind == "up":
+            self._gen = gen
+            self._conn_times.append(t)
+            self._conn.append(("up", gen))
+            self._invalidate(t)                  # a new connection needs a fresh snapshot
+        elif kind == "down":
+            self._gen = None
+            self._conn_times.append(t)
+            self._conn.append(("down", gen))
+            self._invalidate(t)
+        elif kind == "alive":
+            self._alive_times.append(t)
+            self._alive_gens.append(gen)
+        elif kind == "invalidate":
+            self._invalidate(t)
+        elif kind == "msg":
+            self._apply_raw(ev.get("raw"), gen, t)
+        else:
+            raise SimError(f"unknown book event kind {kind!r}")
+        self._trim(t)
+
+    def _invalidate(self, t: datetime) -> None:
+        self._valid = False
+        self._record(t)
+
+    def _apply_raw(self, raw: Any, gen: Optional[int], t: datetime) -> None:
+        import json
+        try:
+            m = json.loads(raw, parse_float=__import__("decimal").Decimal)
+        except (TypeError, ValueError):
+            self._invalidate(t)
+            return
+        if not isinstance(m, dict):
+            self._invalidate(t)
+            return
+        msg = m.get("msg") if isinstance(m.get("msg"), dict) else {}
+        kind = m.get("type")
+        if kind not in ("orderbook_snapshot", "orderbook_delta"):
+            return
         if msg.get("market_ticker") != self.ticker:
             return
-        seq = message.get("seq")
-        if isinstance(seq, bool) or not isinstance(seq, int):
-            raise SimError("message without integer seq")
-        if kind == "orderbook_snapshot":
-            self._yes, self._no = {}, {}
-            for side, key in ((self._yes, "yes_dollars_fp"), (self._no, "no_dollars_fp")):
-                for lvl in msg.get(key) or []:
-                    p, s = _f(lvl[0], "price"), _f(lvl[1], "size")
-                    if s > 0:
-                        side[p] = s
-            self._seq, self._valid = seq, True
-        elif kind == "orderbook_delta":
-            if self._seq is None or seq <= self._seq:
-                return  # before first snapshot, or a duplicate/stale delta
-            if seq != self._seq + 1:
-                self._valid = False  # gap: unusable until the next snapshot
-                self._seq = seq
-                self._record(received_at)
-                return
-            book = self._yes if msg.get("side") == "yes" else (
-                self._no if msg.get("side") == "no" else None)
-            if book is None:
-                raise SimError(f"delta with bad side {msg.get('side')!r}")
-            p = _f(msg.get("price_dollars"), "price")
-            new = book.get(p, Fraction(0)) + _f(msg.get("delta_fp"), "delta")
-            if new < 0:
-                self._valid = False  # impossible book: distrust until a snapshot
-            elif new == 0:
-                book.pop(p, None)
-            else:
-                book[p] = new
-            self._seq = seq
-        else:
+        seq, sid = _int(m.get("seq")), _int(m.get("sid"))
+        if gen is None or gen != self._gen or seq is None:
+            self._invalidate(t)                  # stale generation or malformed
             return
-        self._record(received_at)
+        try:
+            if kind == "orderbook_snapshot":
+                yes, no = {}, {}
+                for side, key in ((yes, "yes_dollars_fp"), (no, "no_dollars_fp")):
+                    levels = msg.get(key) or []
+                    if not isinstance(levels, list):
+                        raise SimError("levels not a list")
+                    for lvl in levels:
+                        if not isinstance(lvl, list) or len(lvl) < 2:
+                            raise SimError("bad level")
+                        p, sz = _f(lvl[0], "price"), _f(lvl[1], "size")
+                        if not (0 < p < 1) or sz < 0:
+                            raise SimError("impossible level")
+                        if sz > 0:
+                            side[p] = sz
+                self._yes, self._no = yes, no
+                self._seq, self._sid, self._book_gen, self._valid = seq, sid, gen, True
+            else:
+                if not self._valid or sid != self._sid or self._book_gen != gen:
+                    self._invalidate(t)
+                    return
+                if seq <= self._seq:
+                    return                       # duplicate / stale
+                if seq != self._seq + 1:
+                    self._seq = seq
+                    self._invalidate(t)          # gap
+                    return
+                book = {"yes": self._yes, "no": self._no}.get(msg.get("side"))
+                if book is None:
+                    raise SimError("bad side")
+                p = _f(msg.get("price_dollars"), "price")
+                if not (0 < p < 1):
+                    raise SimError("impossible price")
+                new = book.get(p, Fraction(0)) + _f(msg.get("delta_fp"), "delta")
+                self._seq = seq
+                if new < 0:
+                    raise SimError("negative level")
+                if new == 0:
+                    book.pop(p, None)
+                else:
+                    book[p] = new
+        except (SimError, TypeError, IndexError):
+            self._invalidate(t)
+            return
+        self._record(t)
+
+    def _record(self, t: datetime) -> None:
+        self._times.append(t)
+        self._states.append(BookState(tuple(sorted(self._yes.items())),
+                                      tuple(sorted(self._no.items())), self._seq or 0,
+                                      self._sid, self._book_gen, t, self._valid))
+
+    def _trim(self, now: datetime) -> None:
+        if self.horizon is None:
+            return
+        cut = now - self.horizon
+        for times, *vals in ((self._times, self._states), (self._alive_times, self._alive_gens)):
+            k = bisect.bisect_left(times, cut)
+            if k > 1:
+                del times[:k - 1]
+                for v in vals:
+                    del v[:k - 1]
+
+    # ---- queries ---------------------------------------------------------------
 
     def level_absent_between(self, book_side: str, price: Fraction, t0: datetime,
                              t1: datetime) -> bool:
-        """True if any recorded state in (t0, t1] lacked this level. If the
-        history no longer reaches back to t0, consumption cannot be
-        cleared on evidence, so this conservatively returns False."""
+        """True if any recorded VALID state in (t0, t1] lacked this level. If
+        history does not reach back to t0, returns False (consumption kept)."""
         if not self._times or self._times[0] > t0:
             return False
         i = bisect.bisect_right(self._times, t0)
         j = bisect.bisect_right(self._times, t1)
         for k in range(i, j):
             st = self._states[k]
-            levels = dict(st.yes if book_side == "yes" else st.no)
-            if price not in levels:
+            if st.valid and price not in dict(st.yes if book_side == "yes" else st.no):
                 return True
         return False
 
     def state_at(self, t: datetime) -> Optional[BookState]:
-        """The book as received at or before t; None if no state or invalid."""
         t = _aware(t)
         i = bisect.bisect_right(self._times, t)
         if i == 0:
             return None
         st = self._states[i - 1]
-        return st if st.valid else None
+        if not st.valid or st.generation is None:
+            return None
+        c = bisect.bisect_right(self._conn_times, t)
+        if c == 0 or self._conn[c - 1] != ("up", st.generation):
+            return None
+        a = bisect.bisect_right(self._alive_times, t)
+        while a > 0 and self._alive_gens[a - 1] != st.generation:
+            a -= 1
+        if a == 0 or t - self._alive_times[a - 1] > MAX_SILENCE:
+            return None
+        return st
+
+
+class BookRecorder:
+    """Persists one market window's book events as JSON lines, then gzips
+    them with a SHA-256. Load replays a (possibly crash-truncated) file."""
+
+    def __init__(self, directory, name: str):
+        from pathlib import Path
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise SimError(f"bad recorder name {name!r}")
+        self.dir = Path(directory)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / f"{name}.jsonl"
+        if self.path.exists():
+            # Drop a torn final line left by a crash so appends stay parseable.
+            data = self.path.read_bytes()
+            cut = data.rfind(b"\n") + 1
+            if cut != len(data):
+                with open(self.path, "r+b") as f:
+                    f.truncate(cut)
+        self._fh = open(self.path, "a", encoding="utf-8")
+
+    def write(self, ev: dict) -> None:
+        import json
+        self._fh.write(json.dumps(ev, sort_keys=True, separators=(",", ":")) + "\n")
+        self._fh.flush()
+
+    def finalize(self) -> tuple[str, str]:
+        """Close, gzip, fsync; returns (path, sha256 of the .gz)."""
+        import gzip
+        import hashlib
+        import os
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        self._fh.close()
+        gz = self.path.with_suffix(".jsonl.gz")
+        data = self.path.read_bytes()
+        with open(gz, "wb") as f:
+            with gzip.GzipFile(fileobj=f, mode="wb", mtime=0) as z:
+                z.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        self.path.unlink()
+        return str(gz), hashlib.sha256(gz.read_bytes()).hexdigest()
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.flush()
+            self._fh.close()
+
+    @staticmethod
+    def load(path) -> list:
+        """Events from a .jsonl or .jsonl.gz file. A torn final line (crash
+        mid-write) is dropped; any other malformed line raises."""
+        import gzip
+        import json
+        from pathlib import Path
+        p = Path(path)
+        text = gzip.decompress(p.read_bytes()).decode() if p.suffix == ".gz" else p.read_text()
+        lines = text.split("\n")
+        out = []
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                if i == len(lines) - 1:      # no trailing newline: torn write
+                    break
+                raise SimError(f"corrupt book event at line {i + 1}")
+        return out
 
 
 class LiquidityLedger:
