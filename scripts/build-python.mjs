@@ -16,6 +16,14 @@ for (const d of ['build', 'dist']) {
   }
 }
 
+console.log('>> Writing the research build manifest (source hashes for the frozen experiment)');
+// Sources are not shipped in the bundle, so the experiment's code identity is
+// computed here from the exact files being frozen and bundled alongside them.
+run(VENV_PY, ['-c',
+  'import pathlib, research_c15; '
+  + 'research_c15.write_build_manifest(pathlib.Path(research_c15.BUILD_MANIFEST_NAME))'],
+  { cwd: PY_DIR });
+
 console.log('>> Running PyInstaller (this takes ~60s)');
 run(VENV_PY, [
   '-m', 'PyInstaller',
@@ -64,6 +72,8 @@ run(VENV_PY, [
   '--hidden-import', 'sim_exec',
   '--hidden-import', 'research_c15',
   '--hidden-import', 'research_c15_live',
+  '--hidden-import', 'research_md',
+  '--add-data', `research_build_manifest.json${process.platform === 'win32' ? ';' : ':'}.`,
   '--hidden-import', 'crossvenue',
   '--hidden-import', 'polymarket_public',
   '--hidden-import', 'remote',

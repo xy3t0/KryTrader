@@ -1226,17 +1226,34 @@ _rx_task = None
 
 
 def _spawn_research_c15() -> None:
-    """Frozen paper research experiment. Off unless config sets
-    research_c15_enabled AND the app is in Paper mode; read at loop start."""
+    """Frozen paper research experiment. Runs when research_c15_enabled in
+    Paper mode, and ALSO whenever an earlier cohort still has pending orders
+    or open positions to resolve (settle-only). Entry acceptance is checked
+    every tick inside the task, so later enable/disable or mode changes apply
+    without a restart."""
     global _rx_task
+    if _rx_task is not None and not _rx_task.done():
+        return
     cfg = STATE.cfg or {}
-    if not cfg.get("research_c15_enabled") or not kalshi_auth.is_paper():
+    want = bool(cfg.get("research_c15_enabled")) and kalshi_auth.is_paper()
+    if not want:
+        try:
+            with db.get_db() as conn:
+                want = conn.execute(
+                    "SELECT 1 FROM rx_orders WHERE state IN ('pending','unpriced') "
+                    "UNION SELECT 1 FROM rw_positions WHERE wallet_id LIKE 'c15-%' LIMIT 1"
+                ).fetchone() is not None
+        except Exception:
+            want = False
+    if not want:
         return
     import research_c15_live
     _rx_task = asyncio.create_task(research_c15_live.run(lambda: STATE.cfg or {}, _loop_stop))
-    _rx_task.add_done_callback(
-        lambda t: (not t.cancelled() and t.exception() is not None)
-        and logger.error(f"research c15 stopped: {t.exception()!r}"))
+
+    def _done(t):
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(f"research c15 stopped: {t.exception()!r}")
+    _rx_task.add_done_callback(_done)
 
 
 async def _stop_loop() -> None:

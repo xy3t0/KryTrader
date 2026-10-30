@@ -55,3 +55,4 @@ simulation/
 
 # Referral pool plaintext (encrypted into electron/system/referral-pool.gen.ts)
 referral-links.txt
+python/research_build_manifest.json
