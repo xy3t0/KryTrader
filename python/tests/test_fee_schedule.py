@@ -695,7 +695,7 @@ def test_lead_time_coverage_interval_and_assumptions():
     assert (c.level, c.start, c.end) == (fs.ASSUMED, listing.hi, listing.lo + timedelta(minutes=10))
     for a in fs.LEAD_TIME_ASSUMPTIONS:
         assert a in c.assumption_ids
-    assert "fee-change-min-lead-time:600s" in c.assumption_ids
+    assert "fee-change-min-lead-time:600000000us" in c.assumption_ids
 
 
 @pytest.mark.parametrize("lead", [timedelta(0), timedelta(seconds=-1), timedelta(seconds=3), 600])
@@ -744,3 +744,79 @@ def test_parsers_require_explicit_coverage():
                                     include_historical=True, coverage=None)
     with pytest.raises(TypeError):
         fs.parse_event_fee_change_pages([J(OBS_EVENT_CHANGES_EMPTY)], AS_OF)
+
+
+# ---- review fixes for 8225be9 ------------------------------------------------
+
+def test_bare_string_ids_cannot_authorize_each_other():
+    # Codex repro: "not-approved" and "approved-not" share every character.
+    with pytest.raises(FeeMetadataError):
+        _cov(ids="not-approved")
+    r = resolve(sc=series_changes(cov=_cov(ids=("not-approved",))))
+    with pytest.raises(FeeMetadataError):
+        fs.admissible(r, "approved-not")
+    with pytest.raises(FeeMetadataError):
+        fs.admissible(r, "not-approved")      # even the matching bare string
+    assert not fs.admissible(r, ("approved-not",))
+    assert fs.admissible(r, ("not-approved",))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("scope", "KXBTC15M"), ("scope", b"KXBTC15M"), ("scope", ("ok", "")), ("scope", (1,)),
+    ("evidence", "cap-1"), ("evidence", (None,)),
+    ("assumption_ids", "a1"), ("assumption_ids", ("a1", 2)), ("assumption_ids", 5),
+])
+def test_coverage_collections_validated_before_normalization(field, value):
+    kw = dict(level=fs.ASSUMED, start=T0, end=T0 + timedelta(hours=1), scope=("*",),
+              evidence=("cap",), assumption_ids=("a",))
+    kw[field] = value
+    with pytest.raises(FeeMetadataError):
+        fs.Coverage(**kw)
+
+
+@pytest.mark.parametrize("bad", ["a", b"a", 5, None, ("a", ""), ("a", 1)])
+def test_admissible_rejects_malformed_acceptance(bad):
+    with pytest.raises(FeeMetadataError):
+        fs.admissible(resolve(), bad)
+
+
+def test_none_coverage_rejects_evidence_too():
+    with pytest.raises(FeeMetadataError):
+        fs.Coverage(fs.NONE, evidence=("cap",))
+
+
+def test_lead_time_ids_are_exact_and_distinct():
+    a = fs.lead_time_assumption_id(timedelta(seconds=10))
+    b = fs.lead_time_assumption_id(timedelta(seconds=10.9))
+    c = fs.lead_time_assumption_id(timedelta(seconds=10, microseconds=1))
+    assert a == "fee-change-min-lead-time:10000000us"
+    assert b == "fee-change-min-lead-time:10900000us"
+    assert len({a, b, c}) == 3
+
+
+def test_policy_for_one_lead_time_does_not_accept_another():
+    snap = AsOf(T0 + timedelta(seconds=10), T0 + timedelta(seconds=12))
+    listing = AsOf(T0, T0 + timedelta(seconds=5))
+    e = event("KXBTC15M-26OCT300700", "KXBTC15M", as_of=snap)
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700", as_of=snap)
+    policy_10s = set(fs.LEAD_TIME_ASSUMPTIONS) | {fs.lead_time_assumption_id(timedelta(seconds=600))}
+    for lead, ok in ((timedelta(seconds=600), True), (timedelta(seconds=600.9), False)):
+        c = fs.lead_time_coverage(listing=listing, lead_time=lead, scope={"*"}, evidence=["cap"])
+        r = resolve(e=e, m=m, ec=event_changes(cov=c), at=T0 + timedelta(seconds=30))
+        assert r.status == RESOLVED and fs.admissible(r, policy_10s) is ok
+
+
+@pytest.mark.parametrize("make", [
+    lambda: resolve(at=AS_OF.hi + TTL + timedelta(seconds=1),
+                    sc=series_changes(cov=_cov(ids=("s-a",)))),                      # stale
+    lambda: resolve(sc=series_changes(hist=False, cov=_cov(ids=("s-a",)))),         # no history
+    lambda: resolve(sc=series_changes(cov=_cov(ids=("s-a",))),
+                    ec=event_changes(cov=fs.Coverage.none())),                      # no coverage
+    lambda: resolve(sc=series_changes(cov=_cov(ids=("s-a",))), at=AS_OF.lo - timedelta(seconds=1)),
+])
+def test_early_unavailable_returns_keep_assumptions_and_coverage(make):
+    r = make()
+    assert r.status == UNAVAILABLE
+    assert r.assumptions == ("s-a",)
+    assert set(r.provenance["coverage"]) == {"series_changes", "event_changes"}
+    assert r.provenance["coverage"]["series_changes"]["assumption_ids"] == ("s-a",)

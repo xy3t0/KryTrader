@@ -281,3 +281,28 @@ def test_end_to_end_replay_of_captured_bodies(tmp_path):
     assert all(x.context == ctx for x in recs)
     for x in recs:
         c.store.get(x.capture_id)
+
+
+# ---- review fix for 8225be9: existing corrupted body -------------------------
+
+def test_put_body_verifies_existing_file():
+    import tempfile
+    s = CaptureStore(tempfile.mkdtemp())
+    d = s.put_body(b"good")
+    (s.bodies / d).write_bytes(b"bad")
+    with pytest.raises(FeeCaptureError):
+        s.put_body(b"good")
+    assert (s.bodies / d).read_bytes() == b"bad"   # corrupted evidence preserved
+
+
+def test_recapture_onto_corrupted_body_fails_without_record(tmp_path):
+    body = b'{"series":{"ticker":"S","fee_type":"quadratic","fee_multiplier":1}}'
+    c = capturer(tmp_path, {"/series/S": RawResponse(200, HDRS, body)})
+    rec, _ = run(c.series("S", batch_id="b"))
+    path = tmp_path / "cap" / "bodies" / rec.body_sha256
+    path.write_bytes(b"tampered")
+    with pytest.raises(FeeCaptureError):
+        run(c.series("S", batch_id="b"))
+    recs = list(c.store.records())
+    assert [r.capture_id for r in recs] == [rec.capture_id]   # no new record appended
+    assert path.read_bytes() == b"tampered"

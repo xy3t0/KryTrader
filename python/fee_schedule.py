@@ -236,6 +236,22 @@ LEAD_TIME_ASSUMPTIONS = (
 )
 
 
+def _string_members(value: Any, name: str) -> tuple[str, ...]:
+    """Members of a collection of identifiers, each a nonempty str. A bare
+    str/bytes is refused: iterating it would yield characters, letting
+    unrelated ids with the same letters authorize each other."""
+    if isinstance(value, (str, bytes, bytearray)):
+        raise FeeMetadataError(f"{name} must be a collection of strings, not a bare string")
+    try:
+        members = tuple(value)
+    except TypeError as e:
+        raise FeeMetadataError(f"{name} must be a collection of strings") from e
+    for m in members:
+        if not isinstance(m, str) or not m:
+            raise FeeMetadataError(f"{name} members must be nonempty strings, got {m!r}")
+    return members
+
+
 @dataclass(frozen=True)
 class Coverage:
     """Which scheduled changes a change listing is known to contain.
@@ -253,9 +269,16 @@ class Coverage:
     assumption_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        # Validate collection shapes before anything is normalized.
+        scope = frozenset(_string_members(self.scope, "Coverage.scope"))
+        ev = _string_members(self.evidence, "Coverage.evidence")
+        ids = tuple(sorted(set(_string_members(self.assumption_ids, "Coverage.assumption_ids"))))
+        object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "evidence", ev)
+        object.__setattr__(self, "assumption_ids", ids)
         if self.level == NONE:
-            if self.start or self.end or self.scope or self.assumption_ids:
-                raise FeeMetadataError("NONE coverage carries no interval, scope or assumptions")
+            if self.start is not None or self.end is not None or scope or ev or ids:
+                raise FeeMetadataError("NONE coverage carries no interval, scope, evidence or assumptions")
             return
         if self.level not in (VERIFIED, ASSUMED):
             raise FeeMetadataError(f"coverage level must be VERIFIED/ASSUMED/NONE, got {self.level!r}")
@@ -263,22 +286,14 @@ class Coverage:
         object.__setattr__(self, "end", _aware(self.end, "Coverage.end"))
         if not self.start < self.end:
             raise FeeMetadataError("Coverage.start must be before Coverage.end")
-        scope = frozenset(self.scope)
-        if not scope or not all(isinstance(t, str) and t for t in scope):
-            raise FeeMetadataError("Coverage.scope must be a nonempty set of tickers (or '*')")
-        object.__setattr__(self, "scope", scope)
-        ev = tuple(self.evidence)
-        if not ev or not all(isinstance(e, str) and e for e in ev):
+        if not scope:
+            raise FeeMetadataError("Coverage.scope must name tickers (or '*')")
+        if not ev:
             raise FeeMetadataError("Coverage needs at least one evidence reference")
-        object.__setattr__(self, "evidence", ev)
-        ids = tuple(sorted(set(self.assumption_ids)))
-        if not all(isinstance(a, str) and a for a in ids):
-            raise FeeMetadataError("assumption ids must be nonempty strings")
         if self.level == VERIFIED and ids:
             raise FeeMetadataError("VERIFIED coverage cannot rest on assumptions")
         if self.level == ASSUMED and not ids:
             raise FeeMetadataError("ASSUMED coverage must name its assumptions")
-        object.__setattr__(self, "assumption_ids", ids)
 
     @classmethod
     def none(cls) -> "Coverage":
@@ -312,11 +327,19 @@ def lead_time_coverage(*, listing: AsOf, lead_time: timedelta, scope: Iterable[s
     if end <= listing.hi:
         raise FeeMetadataError("lead_time shorter than the listing's own uncertainty window")
     return Coverage(
-        level=ASSUMED, start=listing.hi, end=end, scope=frozenset(scope),
-        evidence=tuple(evidence),
-        assumption_ids=LEAD_TIME_ASSUMPTIONS
-        + (f"fee-change-min-lead-time:{int(lead_time.total_seconds())}s",),
+        level=ASSUMED, start=listing.hi, end=end,
+        scope=frozenset(_string_members(scope, "scope")),
+        evidence=_string_members(evidence, "evidence"),
+        assumption_ids=LEAD_TIME_ASSUMPTIONS + (lead_time_assumption_id(lead_time),),
     )
+
+
+def lead_time_assumption_id(lead_time: timedelta) -> str:
+    """Exact, injective id for a lead-time assumption (integer microseconds),
+    so a policy accepting one duration never accepts a different one."""
+    if not isinstance(lead_time, timedelta) or lead_time <= timedelta(0):
+        raise FeeMetadataError("lead_time must be a positive timedelta")
+    return f"fee-change-min-lead-time:{lead_time // timedelta(microseconds=1)}us"
 
 
 # ---- parsed inputs --------------------------------------------------------
@@ -540,7 +563,7 @@ def admissible(result: FeeResolution, accepted_assumptions: Iterable[str]) -> bo
     has_coefficient; admission must not."""
     if not isinstance(result, FeeResolution):
         raise FeeMetadataError("admissible() needs a FeeResolution")
-    accepted = set(accepted_assumptions)
+    accepted = set(_string_members(accepted_assumptions, "accepted_assumptions"))
     return result.has_coefficient and set(result.assumptions) <= accepted
 
 
@@ -634,11 +657,16 @@ def resolve_fee_schedule(
         "waiver_expiry": market.waiver_expiry,
         "as_of": {k: (v.lo, v.hi) for k, v in inputs.items()},
         "ttl": ttl,
+        "coverage": {"series_changes": series_changes.coverage.provenance(),
+                     "event_changes": event_changes.coverage.provenance()},
     }
+    # Attached to every result, including early UNAVAILABLE returns.
+    assumptions = tuple(sorted(set(series_changes.coverage.assumption_ids)
+                               | set(event_changes.coverage.assumption_ids)))
 
     def out(status: str, reason: str, **kw) -> FeeResolution:
         return FeeResolution(status=status, reason=reason, role=role, at=at,
-                             provenance=prov, **kw)
+                             assumptions=assumptions, provenance=prov, **kw)
 
     stale = sorted(k for k, a in inputs.items() if at > a.hi + ttl)
     if stale:
@@ -650,8 +678,6 @@ def resolve_fee_schedule(
     if not series_changes.include_historical:
         return out(UNAVAILABLE, "change_history_required")
 
-    prov["coverage"] = {"series_changes": series_changes.coverage.provenance(),
-                        "event_changes": event_changes.coverage.provenance()}
     # A snapshot observed anywhere in [lo, hi] may already reflect a change
     # scheduled up to hi, even when `at` is earlier: coverage must span
     # [lo, max(at, hi)] for each change listing the result depends on.
@@ -661,9 +687,6 @@ def resolve_fee_schedule(
     ):
         if not cov.covers(ticker, snap.lo, max(at, snap.hi)):
             return out(UNAVAILABLE, f"history_unverified:{label}")
-    assumptions = tuple(sorted(set(series_changes.coverage.assumption_ids)
-                               | set(event_changes.coverage.assumption_ids)))
-
     # Validity ends at the earliest snapshot expiry, coverage expiry, or
     # known boundary after `at`.
     bounds = [a.hi + ttl for a in inputs.values()]
@@ -676,8 +699,7 @@ def resolve_fee_schedule(
     valid_until = min(bounds)
 
     if market.waiver_expiry is not None and at < market.waiver_expiry:
-        return out(WAIVER_UNRESOLVED, "waiver_may_apply", valid_until=valid_until,
-                   assumptions=assumptions)
+        return out(WAIVER_UNRESOLVED, "waiver_may_apply", valid_until=valid_until)
 
     try:
         (s_type, s_mult), s_ids = _resolve_value(
@@ -696,7 +718,7 @@ def resolve_fee_schedule(
             at, "event_multiplier",
         )
     except _Unavailable as u:
-        return out(UNAVAILABLE, u.reason, valid_until=valid_until, assumptions=assumptions)
+        return out(UNAVAILABLE, u.reason, valid_until=valid_until)
 
     fee_type = e_type if e_type is not None else s_type
     mult = e_mult if e_mult is not None else s_mult
@@ -704,7 +726,7 @@ def resolve_fee_schedule(
     prov["type_source"] = "event" if e_type is not None else "series"
     prov["multiplier_source"] = "event" if e_mult is not None else "series"
     common = dict(fee_type=fee_type, multiplier=mult, valid_until=valid_until,
-                  applied_change_ids=applied, assumptions=assumptions)
+                  applied_change_ids=applied)
 
     if fee_type not in KNOWN_FEE_TYPES or fee_type == FEE_TYPE_FLAT:
         return out(UNSUPPORTED, f"fee_type:{fee_type}", **common)

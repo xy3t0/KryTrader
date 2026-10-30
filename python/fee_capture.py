@@ -149,9 +149,17 @@ class CaptureStore:
         self.bodies.mkdir(parents=True, exist_ok=True)
 
     def put_body(self, body: bytes) -> str:
+        """Store body under its digest. If a file already exists there, its
+        content is verified; a mismatch raises and the corrupted file is
+        left untouched for diagnosis (never silently overwritten)."""
         digest = hashlib.sha256(body).hexdigest()
         path = self.bodies / digest
-        if not path.exists():
+        if path.exists():
+            existing = path.read_bytes()
+            if hashlib.sha256(existing).hexdigest() != digest:
+                raise FeeCaptureError(
+                    f"stored body {digest} is corrupted on disk; refusing to reuse it")
+        else:
             tmp = path.with_name(f".{digest}.{uuid.uuid4().hex}.tmp")
             with open(tmp, "wb") as f:
                 f.write(body)
