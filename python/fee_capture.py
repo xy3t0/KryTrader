@@ -31,6 +31,16 @@ import fee_schedule as fs
 DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 MAX_EVENT_CHANGE_PAGES = 200
 
+# Some Kalshi endpoints (/markets/{ticker}, /events/{ticker}) send no
+# Cache-Control and no Age, yet are served through an origin-side cache
+# (x-kalshi-cache-hits) whose lifetime is not declared. Their body's age is
+# then bounded only by assumption: sibling listings declare max-age 15-30 s,
+# and this bound is ten times the larger. The assumption id travels with the
+# observation window into every fee result, so a policy must accept it
+# explicitly (strict does not).
+UNDECLARED_CACHE_BOUND_S = 300
+UNDECLARED_CACHE_ASSUMPTION = f"undeclared-cache-age-at-most-{UNDECLARED_CACHE_BOUND_S}s"
+
 
 class FeeCaptureError(RuntimeError):
     """A capture could not be made, stored, or trusted. `status` and
@@ -124,8 +134,14 @@ class CaptureRecord:
 
     def as_of(self, *, clock_skew_s: float) -> fs.AsOf:
         """Conservative observation window from this capture's own timing and
-        cache headers. Missing or unparseable caching information is refused:
-        without it the body's age is unknown."""
+        cache headers. Unparseable caching information is refused. A response
+        with no Cache-Control and no Age at all gets the assumed
+        UNDECLARED_CACHE_BOUND_S, recorded as an assumption on the window."""
+        if self.cache_control is None and self.age_header is None:
+            return fs.AsOf.from_http(
+                request_sent=self.request_sent, response_received=self.response_received,
+                cache_max_age_s=UNDECLARED_CACHE_BOUND_S, age_s=0, clock_skew_s=clock_skew_s,
+                assumptions=(UNDECLARED_CACHE_ASSUMPTION,))
         cc = (self.cache_control or "").lower()
         directives = [p.strip() for p in cc.split(",") if p.strip()]
         if "no-store" in directives or "no-cache" in directives:

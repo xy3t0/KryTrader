@@ -206,11 +206,26 @@ def test_missing_date_header_refused(env):
     assert not c.usable and "Date" in c.reason
 
 
-@pytest.mark.parametrize("cc", ["public, max-age=15, max-age=30", "public", None])
+@pytest.mark.parametrize("cc", ["public, max-age=15, max-age=30", "public"])
 def test_unknown_cache_age_refused(env, cc):
     conn, clock, net, svc, _ = env
     net.cache_control = cc
     assert not context(conn, svc, clock).usable
+
+
+def test_undeclared_cache_is_an_assumption_conditional_accepts(env, monkeypatch):
+    """No Cache-Control and no Age (as Kalshi sends for /markets/{t}): the
+    assumed bound is carried into the result and must be accepted by policy."""
+    import fee_capture as fcap
+    conn, clock, net, svc, _ = env
+    net.cache_control = None
+    c = context(conn, svc, clock)
+    assert c.usable and fcap.UNDECLARED_CACHE_ASSUMPTION in c.resolution.assumptions
+    assert fctx.UNDECLARED_CACHE_ASSUMPTION == fcap.UNDECLARED_CACHE_ASSUMPTION
+    monkeypatch.setitem(fctx._ACCEPTED, fctx.CONDITIONAL_PAPER,
+                        frozenset({fctx.CONDITIONAL_ASSUMPTION}))
+    c2 = context(conn, svc, clock)
+    assert not c2.usable and c2.reason == "assumptions_not_accepted"
 
 
 def test_partial_pagination_refused(env):

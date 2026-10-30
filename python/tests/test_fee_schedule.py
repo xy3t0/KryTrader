@@ -826,3 +826,13 @@ def test_every_resolution_carries_its_market_ticker():
     for r in (resolve(), resolve(sc=series_changes(cov=fs.Coverage.none())),
               resolve(at=AS_OF.hi + TTL + timedelta(seconds=1))):
         assert r.market_ticker == "KXBTC15M-26OCT300700-00"
+
+
+def test_asof_carries_and_spans_assumptions():
+    t = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
+    a = fs.AsOf(t, t + timedelta(seconds=1), ("b", "a", "a"))
+    assert a.assumptions == ("a", "b")
+    s = fs.AsOf.span([a, fs.AsOf(t - timedelta(seconds=5), t)])
+    assert (s.lo, s.hi, s.assumptions) == (t - timedelta(seconds=5), t + timedelta(seconds=1), ("a", "b"))
+    with pytest.raises(fs.FeeMetadataError):
+        fs.AsOf(t, t, "ab")

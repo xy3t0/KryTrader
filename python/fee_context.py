@@ -72,7 +72,11 @@ STRICT = "strict-v1"
 CONDITIONAL_PAPER = "conditional-paper-v1"
 POLICIES = (STRICT, CONDITIONAL_PAPER)
 CONDITIONAL_ASSUMPTION = f"assume-no-unreported-fee-changes:{CONDITIONAL_PAPER}"
-_ACCEPTED = {STRICT: frozenset(), CONDITIONAL_PAPER: frozenset({CONDITIONAL_ASSUMPTION})}
+# Conditional paper also accepts the assumed bound on undeclared caches
+# (fee_capture.UNDECLARED_CACHE_ASSUMPTION); strict accepts nothing unverified.
+UNDECLARED_CACHE_ASSUMPTION = "undeclared-cache-age-at-most-300s"
+_ACCEPTED = {STRICT: frozenset(),
+             CONDITIONAL_PAPER: frozenset({CONDITIONAL_ASSUMPTION, UNDECLARED_CACHE_ASSUMPTION})}
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _FP_RE = re.compile(r"^[0-9a-f]{64}$")

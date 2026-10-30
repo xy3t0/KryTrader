@@ -209,12 +209,22 @@ def test_as_of_no_store_means_no_cache_age(cc):
     assert _rec(cc).as_of(clock_skew_s=0).lo == T0
 
 
-@pytest.mark.parametrize("cc,age", [(None, None), ("public", None), ("max-age=abc", None),
+@pytest.mark.parametrize("cc,age", [("public", None), ("max-age=abc", None), ("", None),
                                     ("max-age=1, max-age=2", None), ("max-age=15", "-3"),
-                                    ("max-age=15", "soon")])
+                                    ("max-age=15", "soon"), (None, "3")])
 def test_as_of_refuses_unknown_caching(cc, age):
     with pytest.raises(FeeCaptureError):
         _rec(cc, age).as_of(clock_skew_s=0)
+
+
+def test_as_of_undeclared_cache_is_an_assumed_bound():
+    """Kalshi /markets/{t} and /events/{t} send neither Cache-Control nor Age."""
+    import fee_capture as fcap
+    a = _rec(None, None).as_of(clock_skew_s=2)
+    assert a.lo == T0 - timedelta(seconds=fcap.UNDECLARED_CACHE_BOUND_S + 2)
+    assert a.hi == T0 + timedelta(seconds=3)
+    assert a.assumptions == (fcap.UNDECLARED_CACHE_ASSUMPTION,)
+    assert _rec("public, max-age=15", "1").as_of(clock_skew_s=0).assumptions == ()
 
 
 # ---- end to end: captured bodies -> store -> parse -> resolve -------------

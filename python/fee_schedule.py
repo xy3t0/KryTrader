@@ -188,20 +188,35 @@ def _aware(dt: Any, ctx: str) -> datetime:
 
 @dataclass(frozen=True)
 class AsOf:
-    """The interval within which a response reflects origin state."""
+    """The interval within which a response reflects origin state.
+    `assumptions` names any unverified premise the interval rests on (e.g. an
+    assumed bound on an undeclared cache); results built from it carry them."""
     lo: datetime
     hi: datetime
+    assumptions: tuple = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "lo", _aware(self.lo, "AsOf.lo"))
         object.__setattr__(self, "hi", _aware(self.hi, "AsOf.hi"))
         if self.lo > self.hi:
             raise FeeMetadataError("AsOf.lo after AsOf.hi")
+        object.__setattr__(self, "assumptions", tuple(sorted(set(
+            _string_members(self.assumptions, "AsOf.assumptions")))))
+
+    @staticmethod
+    def span(parts: Iterable["AsOf"]) -> "AsOf":
+        """Smallest interval containing every part, carrying all their assumptions."""
+        parts = list(parts)
+        if not parts:
+            raise FeeMetadataError("AsOf.span needs at least one part")
+        return AsOf(min(a.lo for a in parts), max(a.hi for a in parts),
+                    tuple(x for a in parts for x in a.assumptions))
 
     @classmethod
     def from_http(
         cls, *, request_sent: datetime, response_received: datetime,
         cache_max_age_s: float, age_s: float, clock_skew_s: float,
+        assumptions: tuple = (),
     ) -> "AsOf":
         """Conservative interval from a request's timing and cache headers.
         The body may be as old as its Age plus the cache lifetime before the
@@ -217,6 +232,7 @@ class AsOf:
         return cls(
             lo=sent - timedelta(seconds=cache_max_age_s + age_s + clock_skew_s),
             hi=recv + timedelta(seconds=clock_skew_s),
+            assumptions=assumptions,
         )
 
 
@@ -663,7 +679,8 @@ def resolve_fee_schedule(
     }
     # Attached to every result, including early UNAVAILABLE returns.
     assumptions = tuple(sorted(set(series_changes.coverage.assumption_ids)
-                               | set(event_changes.coverage.assumption_ids)))
+                               | set(event_changes.coverage.assumption_ids)
+                               | {x for a in inputs.values() for x in a.assumptions}))
 
     def out(status: str, reason: str, **kw) -> FeeResolution:
         return FeeResolution(status=status, reason=reason, role=role, at=at,

@@ -185,8 +185,7 @@ class FeeMetadataService:
             pages = await self.capturer.event_fee_changes(
                 event_ticker=event_ticker, batch_id=batch_id, context=context)
             snaps = tuple(self._snapshot(r, b) for r, b in pages)
-            return ListingSnapshot(snaps, fs.AsOf(min(s.as_of.lo for s in snaps),
-                                                  max(s.as_of.hi for s in snaps)))
+            return ListingSnapshot(snaps, fs.AsOf.span(s.as_of for s in snaps))
         return await self._get(("event_changes", event_ticker), fetch, force=force)
 
     # ---- context -------------------------------------------------------------------
@@ -282,8 +281,7 @@ def snapshots_from_evidence(service: "FeeMetadataService", ev: dict) -> dict:
             raise FeeServiceError("no event change pages in evidence")
         return {"market": one(ev["market"]), "event": one(ev["event"]),
                 "series": one(ev["series"]), "series_changes": one(ev["series_changes"]),
-                "event_changes": ListingSnapshot(pages, fs.AsOf(min(p.as_of.lo for p in pages),
-                                                                max(p.as_of.hi for p in pages)))}
+                "event_changes": ListingSnapshot(pages, fs.AsOf.span(p.as_of for p in pages))}
     except (KeyError, TypeError) as e:
         raise FeeServiceError(f"malformed evidence: {e}") from e
     except fcap.FeeCaptureError as e:
