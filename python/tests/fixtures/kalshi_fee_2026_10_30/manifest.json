@@ -1,0 +1,142 @@
+[
+  {
+    "name": "series-btc15m",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/series/KXBTC15M",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:13 GMT",
+    "age": "13",
+    "cache_control": "public, max-age=15",
+    "sha256": "ecd9e91ea3a8e0d6a3022eba83a54f409aee33788c5e31b221380abdb946f07f",
+    "bytes": 1140,
+    "file": "series-btc15m.json",
+    "keys": [
+      "series"
+    ],
+    "list_counts": {},
+    "request_started_at": "2026-10-30T10:52:18.684595+00:00"
+  },
+  {
+    "name": "series-btcy",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/series/KXBTCY",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:26 GMT",
+    "age": null,
+    "cache_control": "public, max-age=15",
+    "sha256": "7328dad5e9a0e62887084a3c998fa42fccb32e5d15756b0cf428fb8c82bce02a",
+    "bytes": 765,
+    "file": "series-btcy.json",
+    "keys": [
+      "series"
+    ],
+    "list_counts": {},
+    "request_started_at": "2026-10-30T10:52:18.774599+00:00"
+  },
+  {
+    "name": "series-kxmve",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/series/KXMVE",
+    "status": 404,
+    "response_date": "Fri, 30 Oct 2026 10:52:26 GMT",
+    "age": null,
+    "cache_control": "no-store",
+    "sha256": "dea78f843e46c45482b84c9d9db6d16b10a294376e65bcf67a43484f071428c1",
+    "bytes": 52,
+    "file": "series-kxmve.json",
+    "keys": [
+      "error"
+    ],
+    "list_counts": {},
+    "request_started_at": "2026-10-30T10:52:18.774599+00:00"
+  },
+  {
+    "name": "series-fee-changes",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/series/fee_changes",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:26 GMT",
+    "age": null,
+    "cache_control": "public, max-age=30",
+    "sha256": "6780c8eb7edbb5e1ca3b15166f17cef054befacb2cc8f4bc479c54074a9a2c18",
+    "bytes": 28,
+    "file": "series-fee-changes.json",
+    "keys": [
+      "series_fee_change_arr"
+    ],
+    "list_counts": {
+      "series_fee_change_arr": 0
+    },
+    "request_started_at": "2026-10-30T10:52:18.774599+00:00"
+  },
+  {
+    "name": "series-fee-changes-historical",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/series/fee_changes?show_historical=true",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:26 GMT",
+    "age": null,
+    "cache_control": "public, max-age=30",
+    "sha256": "02456ca55ac0f173d0b1c6a4f124fa66071417fb2ec3ecc0076c5d691e7fafce",
+    "bytes": 17840,
+    "file": "series-fee-changes-historical.json",
+    "keys": [
+      "series_fee_change_arr"
+    ],
+    "list_counts": {
+      "series_fee_change_arr": 107
+    },
+    "request_started_at": "2026-10-30T10:52:18.972919+00:00"
+  },
+  {
+    "name": "event-fee-changes",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/events/fee_changes?limit=20",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:26 GMT",
+    "age": null,
+    "cache_control": "public, max-age=30",
+    "sha256": "4d755a11d76cd85bec7a4758a2d226815fd2a935a5563dbafae35ee9d373da45",
+    "bytes": 36,
+    "file": "event-fee-changes.json",
+    "keys": [
+      "cursor",
+      "event_fee_changes"
+    ],
+    "list_counts": {
+      "event_fee_changes": 0
+    },
+    "request_started_at": "2026-10-30T10:52:18.983990+00:00"
+  },
+  {
+    "name": "markets-btc15m",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXBTC15M&status=open&limit=2",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:12 GMT",
+    "age": "14",
+    "cache_control": "public, max-age=15",
+    "sha256": "b948d55e21d40566f6a740f9497763ba046f5c1d31ccf3db4a5a8f66a6e3441c",
+    "bytes": 2150,
+    "file": "markets-btc15m.json",
+    "keys": [
+      "cursor",
+      "markets"
+    ],
+    "list_counts": {
+      "markets": 1
+    },
+    "request_started_at": "2026-10-30T10:52:18.991570+00:00"
+  },
+  {
+    "name": "series-list",
+    "url": "https://api.elections.kalshi.com/trade-api/v2/series",
+    "status": 200,
+    "response_date": "Fri, 30 Oct 2026 10:52:26 GMT",
+    "age": null,
+    "cache_control": "public, max-age=15",
+    "sha256": "e08e4c1e8e78c2582a0548f53f248035a078eef87b55fe47c650dceb2f102144",
+    "bytes": 19615018,
+    "file": "series-list.json",
+    "keys": [
+      "series"
+    ],
+    "list_counts": {
+      "series": 15550
+    },
+    "request_started_at": "2026-10-30T10:52:19.035148+00:00"
+  }
+]

@@ -1,0 +1,539 @@
+"""Resolve which Kalshi fee schedule applies to a fill: pure, no network.
+
+Answers: for this market, this execution role (taker/maker) and this
+effective time `at`, what fee type, multiplier and quadratic coefficient
+apply, and how sure are we? Fetching, caching and wiring into callers are
+separate (commit 1c). Every input here is an already-parsed snapshot.
+
+Sources, from the docs and payloads captured 2026-10-30:
+  * Series:  GET /series/{t}            -> fee_type, fee_multiplier
+  * Series changes: GET /series/fee_changes?show_historical=true
+                                         -> series_fee_change_arr[]
+  * Event:   GET /events/{t}            -> fee_type_override,
+             fee_multiplier_override (each optional / nullable)
+  * Event changes: GET /events/fee_changes -> event_fee_changes[], cursor;
+             null on a field clears that field's override (falls back to
+             the series value)
+  * Market:  fee_waiver_expiration_time (optional / nullable)
+  * Fee schedule PDF (effective 2026-07-07): taker 0.07*M, maker 0.0175*M;
+    API enum says combo maker uses 0.5 instead of 0.25, i.e. 0.035*M.
+
+Snapshot timing. A response reflects origin state at some unknown instant
+inside an interval [lo, hi] (request time, CDN cache lifetime, Age header,
+clock skew). A change scheduled inside that interval may or may not be
+reflected, so it is never silently assumed either way:
+  * at < lo                     -> UNAVAILABLE(before_snapshot)
+  * lo <= at <= hi              -> snapshot value, unless any change is
+                                   scheduled in [lo, hi] -> UNAVAILABLE
+  * at > hi                     -> a change in [lo, hi] must agree with the
+                                   snapshot (else UNAVAILABLE); then the
+                                   latest change in (hi, at] applies
+Two changes for one target at the same instant with different values ->
+UNAVAILABLE(ambiguous_tie).
+
+Outcomes are distinct statuses, and only RESOLVED and EXPLICIT_ZERO carry a
+coefficient:
+  RESOLVED           coefficient > 0
+  EXPLICIT_ZERO      multiplier_zero | no_maker_fee_for_type
+  UNSUPPORTED        fee type with no documented formula (flat, unknown)
+  UNAVAILABLE        metadata missing, stale, conflicting or incomplete
+  WAIVER_UNRESOLVED  a fee waiver may be in force at `at`; its scope is not
+                     documented, so actual fees are unknown
+
+Historical resolution before a snapshot is UNAVAILABLE here. An exploratory
+backtest estimate, if added, must be a separate, distinctly typed result.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from fractions import Fraction
+from typing import Any, Callable, Iterable, Optional, Sequence
+
+import fees
+
+# ---- constants ------------------------------------------------------------
+
+FEE_TYPE_QUADRATIC = "quadratic"
+FEE_TYPE_MAKER = "quadratic_with_maker_fees"
+FEE_TYPE_COMBO_MAKER = "quadratic_with_combo_maker_fees"
+FEE_TYPE_FLAT = "flat"
+KNOWN_FEE_TYPES = frozenset({FEE_TYPE_QUADRATIC, FEE_TYPE_MAKER, FEE_TYPE_COMBO_MAKER, FEE_TYPE_FLAT})
+
+_TAKER_BASE = Fraction(7, 100)  # 0.07
+_MAKER_BASE = {
+    FEE_TYPE_QUADRATIC: None,                # no maker fee for this type
+    FEE_TYPE_MAKER: Fraction(7, 400),        # 0.0175 = 0.07 * 0.25
+    FEE_TYPE_COMBO_MAKER: Fraction(7, 200),  # 0.035  = 0.07 * 0.5
+}
+
+# Base coefficients have up to 4 decimal places; keep base*M within the
+# coefficient scale fees.quadratic_model_fee accepts.
+MAX_MULTIPLIER_SCALE = fees.MAX_COEFFICIENT_SCALE - 4
+
+TAKER = "taker"
+MAKER = "maker"
+
+RESOLVED = "RESOLVED"
+EXPLICIT_ZERO = "EXPLICIT_ZERO"
+UNSUPPORTED = "UNSUPPORTED"
+UNAVAILABLE = "UNAVAILABLE"
+WAIVER_UNRESOLVED = "WAIVER_UNRESOLVED"
+
+_UNUSABLE_TS = datetime(1, 1, 1, tzinfo=timezone.utc)
+
+
+class FeeMetadataError(ValueError):
+    """A payload is malformed, or inputs are inconsistent with each other."""
+
+
+# ---- primitive parsing ----------------------------------------------------
+
+def _reject_constant(name: str):
+    raise FeeMetadataError(f"non-finite JSON constant {name!r}")
+
+
+def loads(text: str | bytes) -> Any:
+    """json.loads with every JSON number exact: floats become Decimal and
+    NaN/Infinity are rejected. Use this for every payload passed to the
+    parsers below; a payload parsed with plain json.loads is refused."""
+    return json.loads(text, parse_float=Decimal, parse_constant=_reject_constant)
+
+
+def _require(obj: dict, key: str, ctx: str) -> Any:
+    if not isinstance(obj, dict):
+        raise FeeMetadataError(f"{ctx}: expected an object")
+    if key not in obj:
+        raise FeeMetadataError(f"{ctx}: missing required field {key!r}")
+    return obj[key]
+
+
+def _nonempty_str(v: Any, ctx: str) -> str:
+    if not isinstance(v, str) or not v:
+        raise FeeMetadataError(f"{ctx}: expected a nonempty string, got {v!r}")
+    return v
+
+
+def _multiplier(v: Any, ctx: str) -> Decimal:
+    if isinstance(v, bool) or not isinstance(v, (int, Decimal)):
+        raise FeeMetadataError(
+            f"{ctx}: multiplier must be a JSON number parsed exactly (use fee_schedule.loads), "
+            f"got {type(v).__name__} {v!r}"
+        )
+    try:
+        d = fees.to_decimal(v, ctx, max_scale=MAX_MULTIPLIER_SCALE)
+    except fees.FeeInputError as e:
+        raise FeeMetadataError(str(e)) from e
+    if d < 0:
+        raise FeeMetadataError(f"{ctx}: multiplier must be non-negative, got {v!r}")
+    return d
+
+
+def _fee_type(v: Any, ctx: str) -> str:
+    # Unknown strings are kept (the resolver reports UNSUPPORTED); non-strings
+    # are malformed.
+    return _nonempty_str(v, ctx)
+
+
+def parse_ts(v: Any, ctx: str, *, allow_unusable: bool = False) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp to an aware UTC datetime. The zero value
+    0001-01-01T00:00:00Z is not a real time: None if allow_unusable, else an
+    error."""
+    s = _nonempty_str(v, ctx)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError as e:
+        raise FeeMetadataError(f"{ctx}: bad timestamp {s!r}") from e
+    if dt.tzinfo is None:
+        raise FeeMetadataError(f"{ctx}: timestamp without timezone {s!r}")
+    dt = dt.astimezone(timezone.utc)
+    if dt == _UNUSABLE_TS:
+        if allow_unusable:
+            return None
+        raise FeeMetadataError(f"{ctx}: zero-value timestamp {s!r}")
+    return dt
+
+
+def _aware(dt: Any, ctx: str) -> datetime:
+    if not isinstance(dt, datetime) or dt.tzinfo is None:
+        raise FeeMetadataError(f"{ctx}: expected a timezone-aware datetime")
+    return dt.astimezone(timezone.utc)
+
+
+# ---- snapshot timing ------------------------------------------------------
+
+@dataclass(frozen=True)
+class AsOf:
+    """The interval within which a response reflects origin state."""
+    lo: datetime
+    hi: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "lo", _aware(self.lo, "AsOf.lo"))
+        object.__setattr__(self, "hi", _aware(self.hi, "AsOf.hi"))
+        if self.lo > self.hi:
+            raise FeeMetadataError("AsOf.lo after AsOf.hi")
+
+    @classmethod
+    def from_http(
+        cls, *, request_sent: datetime, response_received: datetime,
+        cache_max_age_s: float, age_s: float, clock_skew_s: float,
+    ) -> "AsOf":
+        """Conservative interval from a request's timing and cache headers.
+        The body may be as old as its Age plus the cache lifetime before the
+        request was sent; widened both ways by the allowed clock skew."""
+        for name, v in (("cache_max_age_s", cache_max_age_s), ("age_s", age_s),
+                        ("clock_skew_s", clock_skew_s)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 <= v < 86400):
+                raise FeeMetadataError(f"{name} must be a number in [0, 86400)")
+        sent = _aware(request_sent, "request_sent")
+        recv = _aware(response_received, "response_received")
+        if recv < sent:
+            raise FeeMetadataError("response_received before request_sent")
+        return cls(
+            lo=sent - timedelta(seconds=cache_max_age_s + age_s + clock_skew_s),
+            hi=recv + timedelta(seconds=clock_skew_s),
+        )
+
+
+# ---- parsed inputs --------------------------------------------------------
+
+@dataclass(frozen=True)
+class SeriesSnapshot:
+    ticker: str
+    fee_type: str
+    multiplier: Decimal
+    last_updated: Optional[datetime]  # provenance only; None when unusable
+    as_of: AsOf
+
+
+@dataclass(frozen=True)
+class SeriesFeeChange:
+    id: str
+    series_ticker: str
+    fee_type: str
+    multiplier: Decimal
+    scheduled: datetime
+
+
+@dataclass(frozen=True)
+class SeriesChangeList:
+    changes: tuple[SeriesFeeChange, ...]
+    include_historical: bool
+    as_of: AsOf
+
+
+@dataclass(frozen=True)
+class EventSnapshot:
+    event_ticker: str
+    series_ticker: str
+    type_override: Optional[str]          # None: no override (omitted or null)
+    multiplier_override: Optional[Decimal]
+    type_override_field: str               # "omitted" | "null" | "set"
+    multiplier_override_field: str
+    as_of: AsOf
+
+
+@dataclass(frozen=True)
+class EventFeeChange:
+    id: str
+    event_ticker: str
+    series_ticker: str
+    type_override: Optional[str]           # None clears -> series value
+    multiplier_override: Optional[Decimal]
+    scheduled: datetime
+
+
+@dataclass(frozen=True)
+class EventChangeList:
+    changes: tuple[EventFeeChange, ...]
+    as_of: AsOf
+
+
+@dataclass(frozen=True)
+class MarketFeeInfo:
+    ticker: str
+    event_ticker: str
+    waiver_expiry: Optional[datetime]
+    waiver_field: str                      # "omitted" | "null" | "set"
+
+
+# ---- payload parsers ------------------------------------------------------
+
+def parse_series(payload: dict, as_of: AsOf) -> SeriesSnapshot:
+    s = _require(payload, "series", "series response")
+    ctx = "series"
+    last = s.get("last_updated_ts") if isinstance(s, dict) else None
+    return SeriesSnapshot(
+        ticker=_nonempty_str(_require(s, "ticker", ctx), "series.ticker"),
+        fee_type=_fee_type(_require(s, "fee_type", ctx), "series.fee_type"),
+        multiplier=_multiplier(_require(s, "fee_multiplier", ctx), "series.fee_multiplier"),
+        last_updated=(parse_ts(last, "series.last_updated_ts", allow_unusable=True)
+                      if last not in (None, "") else None),
+        as_of=as_of,
+    )
+
+
+def parse_series_fee_changes(payload: dict, as_of: AsOf, *,
+                             include_historical: bool) -> SeriesChangeList:
+    """`include_historical` must reflect the request actually sent
+    (show_historical=true). The default list holds only pending changes."""
+    if not isinstance(include_historical, bool):
+        raise FeeMetadataError("include_historical must be a bool")
+    arr = _require(payload, "series_fee_change_arr", "series fee changes response")
+    if not isinstance(arr, list):
+        raise FeeMetadataError("series_fee_change_arr must be a list")
+    out = []
+    for i, c in enumerate(arr):
+        ctx = f"series_fee_change_arr[{i}]"
+        out.append(SeriesFeeChange(
+            id=_nonempty_str(_require(c, "id", ctx), f"{ctx}.id"),
+            series_ticker=_nonempty_str(_require(c, "series_ticker", ctx), f"{ctx}.series_ticker"),
+            fee_type=_fee_type(_require(c, "fee_type", ctx), f"{ctx}.fee_type"),
+            multiplier=_multiplier(_require(c, "fee_multiplier", ctx), f"{ctx}.fee_multiplier"),
+            scheduled=parse_ts(_require(c, "scheduled_ts", ctx), f"{ctx}.scheduled_ts"),
+        ))
+    return SeriesChangeList(tuple(out), include_historical, as_of)
+
+
+def _optional_override(obj: dict, key: str, parse: Callable[[Any, str], Any],
+                       ctx: str) -> tuple[Any, str]:
+    if key not in obj:
+        return None, "omitted"
+    if obj[key] is None:
+        return None, "null"
+    return parse(obj[key], f"{ctx}.{key}"), "set"
+
+
+def parse_event(payload: dict, as_of: AsOf) -> EventSnapshot:
+    e = _require(payload, "event", "event response")
+    ctx = "event"
+    t, tf = _optional_override(e, "fee_type_override", _fee_type, ctx)
+    m, mf = _optional_override(e, "fee_multiplier_override", _multiplier, ctx)
+    return EventSnapshot(
+        event_ticker=_nonempty_str(_require(e, "event_ticker", ctx), "event.event_ticker"),
+        series_ticker=_nonempty_str(_require(e, "series_ticker", ctx), "event.series_ticker"),
+        type_override=t, multiplier_override=m,
+        type_override_field=tf, multiplier_override_field=mf,
+        as_of=as_of,
+    )
+
+
+def parse_event_fee_change_pages(pages: Sequence[dict], as_of: AsOf) -> EventChangeList:
+    """All pages of one listing, in order. The final page's cursor must be
+    empty; a partial listing is refused rather than read as 'no changes'."""
+    if not isinstance(pages, (list, tuple)) or not pages:
+        raise FeeMetadataError("event fee change pages: need at least one page")
+    out = []
+    for p_i, page in enumerate(pages):
+        arr = _require(page, "event_fee_changes", f"page[{p_i}]")
+        cursor = _require(page, "cursor", f"page[{p_i}]")
+        if not isinstance(arr, list) or not isinstance(cursor, str):
+            raise FeeMetadataError(f"page[{p_i}]: malformed")
+        last = p_i == len(pages) - 1
+        if last and cursor != "":
+            raise FeeMetadataError("event fee changes: pagination incomplete")
+        if not last and cursor == "":
+            raise FeeMetadataError("event fee changes: page after an empty cursor")
+        for i, c in enumerate(arr):
+            ctx = f"page[{p_i}].event_fee_changes[{i}]"
+            for k in ("fee_type_override", "fee_multiplier_override"):
+                _require(c, k, ctx)  # required by schema even though nullable
+            t = c["fee_type_override"]
+            m = c["fee_multiplier_override"]
+            out.append(EventFeeChange(
+                id=_nonempty_str(_require(c, "id", ctx), f"{ctx}.id"),
+                event_ticker=_nonempty_str(_require(c, "event_ticker", ctx), f"{ctx}.event_ticker"),
+                series_ticker=_nonempty_str(_require(c, "series_ticker", ctx), f"{ctx}.series_ticker"),
+                type_override=None if t is None else _fee_type(t, f"{ctx}.fee_type_override"),
+                multiplier_override=None if m is None else _multiplier(m, f"{ctx}.fee_multiplier_override"),
+                scheduled=parse_ts(_require(c, "scheduled_ts", ctx), f"{ctx}.scheduled_ts"),
+            ))
+    return EventChangeList(tuple(out), as_of)
+
+
+def parse_market(market: dict) -> MarketFeeInfo:
+    """A single market object (the value of `market`, or one element of
+    `markets`)."""
+    ctx = "market"
+    w, wf = _optional_override(
+        market if isinstance(market, dict) else {}, "fee_waiver_expiration_time",
+        lambda v, c: parse_ts(v, c), ctx,
+    )
+    return MarketFeeInfo(
+        ticker=_nonempty_str(_require(market, "ticker", ctx), "market.ticker"),
+        event_ticker=_nonempty_str(_require(market, "event_ticker", ctx), "market.event_ticker"),
+        waiver_expiry=w, waiver_field=wf,
+    )
+
+
+# ---- resolution -----------------------------------------------------------
+
+@dataclass(frozen=True)
+class FeeResolution:
+    status: str
+    reason: str
+    role: str
+    at: datetime
+    fee_type: Optional[str] = None
+    multiplier: Optional[Decimal] = None
+    coefficient: Optional[Decimal] = None  # only for RESOLVED / EXPLICIT_ZERO
+    valid_until: Optional[datetime] = None
+    applied_change_ids: tuple[str, ...] = ()
+    provenance: dict = field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        return self.status in (RESOLVED, EXPLICIT_ZERO)
+
+
+class _Unavailable(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _resolve_value(snapshot_value: Any, as_of: AsOf,
+                   changes: Iterable[tuple[datetime, Any, str]],
+                   at: datetime, label: str) -> tuple[Any, tuple[str, ...]]:
+    """Value of one target at `at`, from a snapshot taken somewhere in
+    [as_of.lo, as_of.hi] plus scheduled changes (ts, value, id)."""
+    by_ts: dict[datetime, tuple[Any, list[str]]] = {}
+    for ts, value, cid in changes:
+        if ts in by_ts:
+            if by_ts[ts][0] != value:
+                raise _Unavailable(f"ambiguous_tie:{label}")
+            by_ts[ts][1].append(cid)
+        else:
+            by_ts[ts] = (value, [cid])
+    ordered = sorted(by_ts.items())
+    window = [(ts, v, ids) for ts, (v, ids) in ordered if as_of.lo <= ts <= as_of.hi]
+
+    if at < as_of.lo:
+        raise _Unavailable(f"before_snapshot:{label}")
+    if at <= as_of.hi:
+        if window:
+            raise _Unavailable(f"snapshot_boundary_conflict:{label}")
+        return snapshot_value, ()
+    if window and window[-1][1] != snapshot_value:
+        raise _Unavailable(f"snapshot_boundary_conflict:{label}")
+    after = [(ts, v, ids) for ts, (v, ids) in ordered if as_of.hi < ts <= at]
+    if after:
+        return after[-1][1], tuple(after[-1][2])
+    return snapshot_value, ()
+
+
+def _next_boundary(changes: Iterable[datetime], at: datetime) -> Optional[datetime]:
+    later = [ts for ts in changes if ts > at]
+    return min(later) if later else None
+
+
+def resolve_fee_schedule(
+    *,
+    market: MarketFeeInfo,
+    series: SeriesSnapshot,
+    series_changes: SeriesChangeList,
+    event: EventSnapshot,
+    event_changes: EventChangeList,
+    role: str,
+    at: datetime,
+    ttl: timedelta,
+) -> FeeResolution:
+    """Resolve the fee schedule for one role at one instant. `ttl` is
+    caller-supplied: how long after each snapshot's hi bound it may be
+    trusted. Known change boundaries and waiver expiries end validity
+    regardless of ttl (see valid_until)."""
+    if role not in (TAKER, MAKER):
+        raise FeeMetadataError(f"role must be {TAKER!r} or {MAKER!r}, got {role!r}")
+    at = _aware(at, "at")
+    if not isinstance(ttl, timedelta) or ttl < timedelta(0):
+        raise FeeMetadataError("ttl must be a non-negative timedelta")
+    if market.event_ticker != event.event_ticker:
+        raise FeeMetadataError("market and event snapshots disagree on event_ticker")
+    if event.series_ticker != series.ticker:
+        raise FeeMetadataError("event and series snapshots disagree on series_ticker")
+
+    s_changes = [c for c in series_changes.changes if c.series_ticker == series.ticker]
+    e_changes = [c for c in event_changes.changes if c.event_ticker == event.event_ticker]
+    inputs = {
+        "series": series.as_of, "series_changes": series_changes.as_of,
+        "event": event.as_of, "event_changes": event_changes.as_of,
+    }
+    prov: dict = {
+        "series_ticker": series.ticker,
+        "event_ticker": event.event_ticker,
+        "market_ticker": market.ticker,
+        "series_last_updated": series.last_updated,
+        "event_type_override_field": event.type_override_field,
+        "event_multiplier_override_field": event.multiplier_override_field,
+        "waiver_field": market.waiver_field,
+        "waiver_expiry": market.waiver_expiry,
+        "as_of": {k: (v.lo, v.hi) for k, v in inputs.items()},
+        "ttl": ttl,
+    }
+
+    def out(status: str, reason: str, **kw) -> FeeResolution:
+        return FeeResolution(status=status, reason=reason, role=role, at=at,
+                             provenance=prov, **kw)
+
+    stale = sorted(k for k, a in inputs.items() if at > a.hi + ttl)
+    if stale:
+        return out(UNAVAILABLE, "stale:" + ",".join(stale))
+    if not series_changes.include_historical:
+        return out(UNAVAILABLE, "change_history_required")
+
+    # Validity ends at the earliest snapshot expiry or known boundary after `at`.
+    bounds = [a.hi + ttl for a in inputs.values()]
+    nb = _next_boundary([c.scheduled for c in s_changes] + [c.scheduled for c in e_changes], at)
+    if nb is not None:
+        bounds.append(nb)
+    if market.waiver_expiry is not None and market.waiver_expiry > at:
+        bounds.append(market.waiver_expiry)
+    valid_until = min(bounds)
+
+    if market.waiver_expiry is not None and at < market.waiver_expiry:
+        return out(WAIVER_UNRESOLVED, "waiver_may_apply", valid_until=valid_until)
+
+    try:
+        (s_type, s_mult), s_ids = _resolve_value(
+            (series.fee_type, series.multiplier), series.as_of,
+            ((c.scheduled, (c.fee_type, c.multiplier), c.id) for c in s_changes),
+            at, "series",
+        )
+        e_type, e_type_ids = _resolve_value(
+            event.type_override, event.as_of,
+            ((c.scheduled, c.type_override, c.id) for c in e_changes),
+            at, "event_type",
+        )
+        e_mult, e_mult_ids = _resolve_value(
+            event.multiplier_override, event.as_of,
+            ((c.scheduled, c.multiplier_override, c.id) for c in e_changes),
+            at, "event_multiplier",
+        )
+    except _Unavailable as u:
+        return out(UNAVAILABLE, u.reason, valid_until=valid_until)
+
+    fee_type = e_type if e_type is not None else s_type
+    mult = e_mult if e_mult is not None else s_mult
+    applied = tuple(dict.fromkeys(s_ids + e_type_ids + e_mult_ids))
+    prov["type_source"] = "event" if e_type is not None else "series"
+    prov["multiplier_source"] = "event" if e_mult is not None else "series"
+    common = dict(fee_type=fee_type, multiplier=mult, valid_until=valid_until,
+                  applied_change_ids=applied)
+
+    if fee_type not in KNOWN_FEE_TYPES or fee_type == FEE_TYPE_FLAT:
+        return out(UNSUPPORTED, f"fee_type:{fee_type}", **common)
+
+    if role == TAKER:
+        base = _TAKER_BASE
+    else:
+        base = _MAKER_BASE[fee_type]
+        if base is None:
+            return out(EXPLICIT_ZERO, "no_maker_fee_for_type",
+                       coefficient=Decimal(0), **common)
+    coeff = base * fees.to_fraction(mult, "multiplier", max_scale=MAX_MULTIPLIER_SCALE)
+    if coeff == 0:
+        return out(EXPLICIT_ZERO, "multiplier_zero", coefficient=Decimal(0), **common)
+    return out(RESOLVED, "ok", coefficient=fees.fraction_to_decimal(coeff), **common)

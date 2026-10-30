@@ -165,6 +165,19 @@ def _frac_to_decimal(f: Fraction) -> Decimal:
     return Decimal((sign, digits, -k))
 
 
+def to_fraction(value: DecimalLike, name: str = "value", *,
+                max_scale: int = MAX_SCALE) -> Fraction:
+    """Public exact conversion of a bounded decimal input to Fraction."""
+    return _to_frac(value, name, max_scale=max_scale)
+
+
+def fraction_to_decimal(f: Fraction) -> Decimal:
+    """Public exact conversion of a decimal-valued Fraction to Decimal."""
+    if not isinstance(f, Fraction):
+        raise FeeInputError("fraction_to_decimal expects a Fraction")
+    return _frac_to_decimal(f)
+
+
 def _ceil_to(x: Fraction, q: Fraction) -> Fraction:
     return math.ceil(x / q) * q
 
