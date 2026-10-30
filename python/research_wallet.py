@@ -157,7 +157,8 @@ class Wallet:
 
     @property
     def available(self) -> Decimal:
-        return self.cash - self.reserved
+        # Exact: Decimal subtraction would round under the caller's context.
+        return fees.fraction_to_decimal(Fraction(self.cash) - Fraction(self.reserved))
 
 
 def create_wallet(conn, *, wallet_id: str, account_id: str, policy: str,
@@ -229,7 +230,7 @@ def reserve(conn, *, wallet_id: str, order_id: str, amount: Any, at: datetime,
         raise WalletError("reservation must be positive")
     with _Savepoint(conn, "rw_reserve"):
         w = get_wallet(conn, wallet_id)
-        if Fraction(w.available) < amt:
+        if Fraction(w.cash) - Fraction(w.reserved) < amt:
             raise InsufficientFunds(f"available {w.available} < reservation {_dec(amt)}")
         try:
             conn.execute("INSERT INTO rw_reservations VALUES (?,?,?)", (wallet_id, order_id, _dec(amt)))

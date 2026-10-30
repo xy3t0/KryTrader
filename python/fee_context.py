@@ -184,7 +184,16 @@ def bind_credential(conn: sqlite3.Connection, *, kalshi_env: str, account_id: st
         if seen and seen != {observed_user_id}:
             raise FeeContextError("observed user_id disagrees with this account's earlier observation")
     if other is not None:
-        return  # already actively bound to this account
+        # Already bound to this account: an API observation upgrades the
+        # binding (identity checks above already passed); otherwise no-op.
+        if binding_source == "api_observed":
+            conn.execute(
+                "UPDATE fee_account_bindings SET binding_source='api_observed', "
+                "observed_user_id=?, observed_subaccount=?, evidence_ref=? WHERE kalshi_env=? "
+                "AND account_id=? AND credential_fingerprint=? AND revoked_at IS NULL",
+                (observed_user_id, observed_subaccount, evidence_ref, env, acct,
+                 credential_fingerprint))
+        return
     conn.execute(
         "INSERT INTO fee_account_bindings VALUES (?,?,?,?,?,?,?,?,NULL)",
         (env, acct, credential_fingerprint, binding_source, observed_user_id,

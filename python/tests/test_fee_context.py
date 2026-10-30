@@ -209,3 +209,16 @@ def test_unknown_policy_refused(conn):
     reg(conn)
     with pytest.raises(fc.FeeContextError):
         ctx(conn, policy="yolo")
+
+
+def test_configured_binding_upgrades_to_api_observed(conn):
+    reg(conn, env="production", acct="live-1", sub=0)
+    bind(conn, FP1, acct="live-1", env="production")             # user_configured first
+    bind(conn, FP1, acct="live-1", env="production", src="api_observed",
+         observed_user_id="user-123", observed_subaccount=0, evidence_ref="cap-9")
+    row = conn.execute("SELECT binding_source, observed_user_id, observed_subaccount, evidence_ref "
+                       "FROM fee_account_bindings").fetchone()
+    assert row == ("api_observed", "user-123", 0, "cap-9")
+    with pytest.raises(fc.FeeContextError):                      # later disagreement refused
+        bind(conn, FP1, acct="live-1", env="production", src="api_observed",
+             observed_user_id="user-999", evidence_ref="cap-10")

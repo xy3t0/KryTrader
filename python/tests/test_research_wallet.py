@@ -226,3 +226,22 @@ def test_unresolved_settlement_not_accepted(conn):
     fill(conn)
     with pytest.raises(rw.WalletError):
         rw.settle(conn, wallet_id="w4", ticker=MKT, result="void", settled_at=T0, evidence=("s",))
+
+
+def test_affordability_exact_under_low_precision_and_traps(conn):
+    # Codex repro: under prec=4, $3.99996 cash could reserve $4.
+    from decimal import Inexact, Rounded, localcontext
+    rw.create_wallet(conn, wallet_id="w-edge", account_id="research-1",
+                     policy=fctx.CONDITIONAL_PAPER, starting_cash="3.99996")
+    with localcontext() as ctx:
+        ctx.prec = 4
+        with pytest.raises(rw.InsufficientFunds):
+            rw.reserve(conn, wallet_id="w-edge", order_id="o1", amount="4", at=T0)
+        ctx.traps[Inexact] = True
+        ctx.traps[Rounded] = True
+        rw.reserve(conn, wallet_id="w-edge", order_id="o2", amount="3.99995", at=T0)
+        with pytest.raises(rw.InsufficientFunds):     # 0.00001 left; 0.00002 refused
+            rw.reserve(conn, wallet_id="w-edge", order_id="o3", amount="0.00002", at=T0)
+        w = rw.get_wallet(conn, "w-edge")
+        assert w.available == D("0.00001")
+    assert w.reserved <= w.cash and rw.reconcile(conn, "w-edge")["ok"]
