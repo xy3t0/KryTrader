@@ -403,8 +403,8 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
               send: Optional[Callable] = None,
               candle_post: Optional[Callable] = None,
               clock: Callable[[], datetime] = server_now,
-              spot_reads: Callable[[], list] = default_spot_reads,
-              prints: Callable[[float, float], tuple] = default_prints,
+              spot_reads: Optional[Callable[[], list]] = None,     # None: bound to the
+              prints: Optional[Callable[[float, float], tuple]] = None,  # experiment's CF state
               local_time: Callable[[], float] = time.time,
               tick_s: float = 1.0) -> None:
     """The experiment process. Every resource is released in `finally`,

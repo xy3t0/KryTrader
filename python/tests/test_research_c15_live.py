@@ -584,3 +584,46 @@ def test_switch_file_enables_without_config_key(env, monkeypatch):
         await asyncio.wait_for(task, 10)
     asyncio.run(go())
     assert conn.execute("SELECT status FROM rx_cohorts").fetchone()[0] == "active"
+
+
+def test_default_spot_and_print_sources_are_bound_to_the_experiment(env, monkeypatch):
+    """run() without injected spot/print readers uses the production defaults,
+    bound to the experiment's own CF state (regression: the unbound defaults
+    raised on every tick, so the cohort could never launch)."""
+    conn, clock, spot, tmp = env
+    import kalshi_auth
+    import spot_ws
+    monkeypatch.setattr(kalshi_auth, "is_paper", lambda env=None: True)
+
+    class FakeClient:
+        connected = True
+
+        @property
+        def prices(self):
+            return {rx.PARAMS["asset"]: (clock().timestamp() - 1, 77700.0)}
+    monkeypatch.setattr(spot_ws, "_client", FakeClient())
+    monkeypatch.setattr(spot_ws, "is_running", lambda: True)
+    monkeypatch.setattr(spot_ws, "window_partial", lambda a, c, now=None: (0.0, 0))
+    clock.t = CLOSE - timedelta(seconds=80)
+
+    async def go():
+        stop = asyncio.Event()
+
+        async def advance():
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                clock.t += timedelta(seconds=0.5)
+        adv = asyncio.ensure_future(advance())
+        task = asyncio.ensure_future(live.run(
+            lambda: {"research_c15_enabled": True}, stop,
+            make_md=lambda on_event, on_cf: FakeMD(on_event, clock), send=SettlingKalshi(clock),
+            candle_post=candles(clock), clock=clock,
+            local_time=lambda: clock().timestamp(), tick_s=0.005))
+        await asyncio.sleep(1.5)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+        await adv
+    asyncio.run(go())
+    reasons = [r[0] for r in conn.execute("SELECT reason FROM rx_downtime")]
+    assert not any("argument" in r for r in reasons), reasons
+    assert conn.execute("SELECT status FROM rx_cohorts").fetchone()[0] == "active"
