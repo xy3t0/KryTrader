@@ -747,6 +747,9 @@ def init_db() -> None:
                          "WHERE source='mcp' AND (agent_id IS NULL OR agent_id='')")
         except sqlite3.OperationalError:
             pass
+        # Exact fee ledger (additive) + legacy marker on old REAL fee columns.
+        import fee_ledger
+        fee_ledger.init_schema(conn)
 
 
 def factory_reset(*, wipe_markets: bool = False) -> dict:
