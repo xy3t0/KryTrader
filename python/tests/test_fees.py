@@ -8,6 +8,7 @@ from __future__ import annotations
 import random
 import sys
 from decimal import Decimal as D
+from decimal import Inexact, Rounded, localcontext
 from pathlib import Path
 
 import pytest
@@ -187,9 +188,133 @@ def test_serialization_round_trip():
         st2.apply_fill("f2", D("-0.97"), D("0.002037"))
 
 
-def test_from_dict_rejects_float_serialization():
+_GOOD_STATE = {"order_id": "o", "precision": "0.0001", "accumulator": "0",
+               "applied_fill_ids": ["fill-123"]}
+
+
+@pytest.mark.parametrize("patch", [
+    {"precision": 0.01},                       # float precision
+    {"accumulator": 0},                        # non-string accumulator
+    {"applied_fill_ids": "fill-123"},          # string would become a set of chars
+    {"applied_fill_ids": None},                # null history
+    {"applied_fill_ids": ("fill-123",)},       # tuple, not list
+    {"applied_fill_ids": {"fill-123"}},        # set, not list
+    {"applied_fill_ids": [123]},               # non-string id
+    {"applied_fill_ids": [""]},                # empty id
+    {"applied_fill_ids": ["a", "a"]},          # duplicated id
+    {"order_id": ""},
+    {"order_id": 7},
+    {"precision": "NaN"},
+    {"accumulator": "-0.01"},
+])
+def test_from_dict_rejects_malformed(patch):
     with pytest.raises(FeeInputError):
-        OrderFeeState.from_dict({"order_id": "o", "precision": 0.01, "accumulator": "0"})
+        OrderFeeState.from_dict({**_GOOD_STATE, **patch})
+
+
+@pytest.mark.parametrize("key", sorted(_GOOD_STATE))
+def test_from_dict_requires_every_field(key):
+    d = dict(_GOOD_STATE)
+    del d[key]
+    with pytest.raises(FeeInputError):
+        OrderFeeState.from_dict(d)
+
+
+def test_from_dict_history_blocks_reapplying_restored_fill():
+    st = OrderFeeState.from_dict(_GOOD_STATE)
+    assert st.applied_fill_ids == {"fill-123"}
+    with pytest.raises(DuplicateFillError):
+        st.apply_fill("fill-123", D("-0.5"), D(0))
+
+
+@pytest.mark.parametrize("bad_id", [123, None, "", b"f1"])
+def test_apply_fill_rejects_non_string_ids_without_mutation(bad_id):
+    st = OrderFeeState("o1", DIRECT)
+    st.apply_fill("f0", D("-0.5"), D(0))
+    before = st.to_dict()
+    with pytest.raises(FeeInputError):
+        st.apply_fill(bad_id, D("-0.5"), D(0))
+    assert st.to_dict() == before
+
+
+@pytest.mark.parametrize("ids", ["f1", [1, 2], [""], None])
+def test_constructor_rejects_bad_fill_id_collections(ids):
+    with pytest.raises(FeeInputError):
+        OrderFeeState("o1", DIRECT, applied_fill_ids=ids)
+
+
+# ---- independence from the caller's decimal context -----------------------
+
+def test_result_independent_of_low_precision_context():
+    """Codex repro: prec=4 used to give r=0, net 0.002037, delta -0.9720."""
+    with localcontext() as ctx:
+        ctx.prec = 4
+        res = settle_fill("-0.97", "0.002037", "0.0001")
+    assert res.rounding_fee == D("0.000063")
+    assert res.net_fee == D("0.002100")
+    assert res.balance_delta == D("-0.9721")
+
+
+def test_no_decimal_arithmetic_happens_under_the_hood():
+    """With prec=1 and Inexact/Rounded trapped, ANY rounding Decimal operation
+    inside the core would raise. Everything must still be exact."""
+    with localcontext() as ctx:
+        ctx.prec = 1
+        ctx.traps[Inexact] = True
+        ctx.traps[Rounded] = True
+        st = OrderFeeState("o1", "0.01")
+        r1 = st.apply_fill("f1", fill_revenue("0.97", "3.5", "buy"),
+                           quadratic_model_fee("0.97", "3.5", "0.07"))
+        r2 = st.apply_fill("f2", "-0.05", "0.000001")
+        round_trip = OrderFeeState.from_dict(st.to_dict())
+    # Independently specified: revenue -3.395, model fee 0.07*3.5*0.97*0.03 = 0.0071295
+    assert r1.trade_fee == D("0.00713")
+    assert r1.balance_delta == D("-3.41")             # floor(-3.40213, 0.01)
+    assert r1.rounding_fee == D("0.00787")            # -3.40213 - (-3.41)
+    assert r2.rounding_fee == D("0.009999")
+    assert r2.rebate == D("0.01")                     # acc 0.017869 >= 1c, t+r = 0.01
+    assert round_trip == st
+
+
+def test_long_model_fee_rounds_up_exactly():
+    """Codex repro: 1e-6 + 1e-40 used to round to 0.000001 under default prec."""
+    res = settle_fill("-0.5", "0.0000010000000000000000000000000000000001", "0.0001")
+    assert res.trade_fee == D("0.000002")
+
+
+@pytest.mark.parametrize("value", [
+    "0.00000100000000000000000000000000000000001",  # 41 significant decimal places
+    "1E-41",
+    "1000000000000",                                 # 10**12
+    "1E+12",
+])
+def test_out_of_bounds_amounts_rejected(value):
+    with pytest.raises(FeeInputError):
+        settle_fill("-0.5", value, "0.0001")
+
+
+def test_trailing_zeros_and_zero_spellings_accepted():
+    assert fees.to_decimal("0.50000000000000000000000000000000000000000000000") == D("0.5")
+    assert fees.to_decimal("0E-999999") == 0
+    assert fees.to_decimal("-0.00") == 0
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(price="0.5000001", count=1, coefficient="0.07"),     # price scale > 6
+    dict(price="0.5", count="1.0000001", coefficient="0.07"),  # count scale > 6
+    dict(price="0.5", count=1, coefficient="0.00000000001"),   # coefficient scale > 10
+])
+def test_model_fee_input_scales_bounded(kwargs):
+    with pytest.raises(FeeInputError):
+        quadratic_model_fee(**kwargs)
+
+
+def test_rounding_helpers_exact():
+    assert fees.ceil_to("0.0000010000000000000000000000000000000001", "0.000001") == D("0.000002")
+    assert fees.floor_to("-0.050001", "0.01") == D("-0.06")
+    with localcontext() as ctx:
+        ctx.prec = 2
+        assert fees.floor_to("-123.456789", "0.0001") == D("-123.4568")
 
 
 # ---- fractional counts (pure math; venue support verified separately) ----
@@ -242,11 +367,9 @@ def test_fill_revenue_rejects_bad_action():
 
 
 def test_order_state_requires_ids():
-    with pytest.raises(FeeInputError):
-        OrderFeeState("", DIRECT)
-    st = OrderFeeState("o", DIRECT)
-    with pytest.raises(FeeInputError):
-        st.apply_fill("", D("-0.5"), D(0))
+    for bad in ("", None, 5):
+        with pytest.raises(FeeInputError):
+            OrderFeeState(bad, DIRECT)
 
 
 # ---- invariant sweep -------------------------------------------------------
