@@ -406,8 +406,10 @@ class _Client:
             self._on_subscribed(m)
         elif t == "orderbook_snapshot":
             self._on_snapshot(m)
+            _notify_book_listeners(m)
         elif t == "orderbook_delta":
             self._on_delta(m)
+            _notify_book_listeners(m)
         elif t == "ticker":
             self._on_ticker(m)
         elif t == "trade":
@@ -675,6 +677,35 @@ def add_orderbook_markets(tickers) -> None:
 
 def set_lifecycle_markets(tickers) -> None:
     _client.set_lifecycle_markets(tickers)
+
+
+# Raw orderbook message listeners (research book tapes). Each receives the
+# untouched message and its local receipt time. A failing listener is logged
+# and never disturbs the feed.
+_book_listeners: list = []
+
+
+def add_book_listener(fn) -> None:
+    if fn not in _book_listeners:
+        _book_listeners.append(fn)
+
+
+def remove_book_listener(fn) -> None:
+    if fn in _book_listeners:
+        _book_listeners.remove(fn)
+
+
+def _notify_book_listeners(m: dict) -> None:
+    if not _book_listeners:
+        return
+    from datetime import datetime, timezone
+    import kalshi_auth as _ka  # server-aligned clock, same as decisions use
+    received = datetime.fromtimestamp(_ka.server_now(), timezone.utc)
+    for fn in list(_book_listeners):
+        try:
+            fn(m, received)
+        except Exception as e:
+            logger.warning(f"kalshi_ws: book listener failed: {e}")
 
 
 def orderbook(ticker: str) -> Optional[dict]:
