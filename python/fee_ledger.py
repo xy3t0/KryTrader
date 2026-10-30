@@ -189,6 +189,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     fee_context.init_schema(conn)
     import research_wallet  # isolated research wallets (A3)
     research_wallet.init_schema(conn)
+    import sim_exec  # simulated liquidity consumption (B2)
+    conn.executescript(sim_exec.LIQUIDITY_SCHEMA)
+    import research_c15  # frozen experiment records (C2)
+    research_c15.init_schema(conn)
     for stmt in legacy_source_migrations():
         try:
             conn.execute(stmt)

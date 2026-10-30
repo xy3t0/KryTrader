@@ -1219,13 +1219,31 @@ async def _start_loop() -> None:
     _spawn_main_loop()
     _spawn_c15_loop()
     _spawn_script_loop()
+    _spawn_research_c15()
+
+
+_rx_task = None
+
+
+def _spawn_research_c15() -> None:
+    """Frozen paper research experiment. Off unless config sets
+    research_c15_enabled AND the app is in Paper mode; read at loop start."""
+    global _rx_task
+    cfg = STATE.cfg or {}
+    if not cfg.get("research_c15_enabled") or not kalshi_auth.is_paper():
+        return
+    import research_c15_live
+    _rx_task = asyncio.create_task(research_c15_live.run(lambda: STATE.cfg or {}, _loop_stop))
+    _rx_task.add_done_callback(
+        lambda t: (not t.cancelled() and t.exception() is not None)
+        and logger.error(f"research c15 stopped: {t.exception()!r}"))
 
 
 async def _stop_loop() -> None:
     global _loop_task, _c15_task, _loop_stop
     if _loop_stop:
         _loop_stop.set()
-    for task in (_loop_task, _c15_task, _script_task):
+    for task in (_loop_task, _c15_task, _script_task, _rx_task):
         if task:
             try:
                 await asyncio.wait_for(task, timeout=5)
