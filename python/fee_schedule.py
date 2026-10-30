@@ -98,13 +98,26 @@ def _reject_constant(name: str):
 def loads(text: str | bytes) -> Any:
     """json.loads with every JSON number exact: floats become Decimal and
     NaN/Infinity are rejected. Use this for every payload passed to the
-    parsers below; a payload parsed with plain json.loads is refused."""
-    return json.loads(text, parse_float=Decimal, parse_constant=_reject_constant)
+    parsers below; a payload parsed with plain json.loads is refused.
+    Every decoding failure surfaces as FeeMetadataError (cause preserved)."""
+    if not isinstance(text, (str, bytes, bytearray)):
+        raise FeeMetadataError(f"payload must be str or bytes, got {type(text).__name__}")
+    try:
+        return json.loads(text, parse_float=Decimal, parse_constant=_reject_constant)
+    except FeeMetadataError:
+        raise
+    except (ValueError, RecursionError) as e:  # JSONDecodeError, UnicodeDecodeError
+        raise FeeMetadataError(f"payload is not valid JSON: {e}") from e
+
+
+def _obj(v: Any, ctx: str) -> dict:
+    if not isinstance(v, dict):
+        raise FeeMetadataError(f"{ctx}: expected an object, got {type(v).__name__}")
+    return v
 
 
 def _require(obj: dict, key: str, ctx: str) -> Any:
-    if not isinstance(obj, dict):
-        raise FeeMetadataError(f"{ctx}: expected an object")
+    _obj(obj, ctx)
     if key not in obj:
         raise FeeMetadataError(f"{ctx}: missing required field {key!r}")
     return obj[key]
@@ -258,14 +271,15 @@ class MarketFeeInfo:
     event_ticker: str
     waiver_expiry: Optional[datetime]
     waiver_field: str                      # "omitted" | "null" | "set"
+    as_of: AsOf
 
 
 # ---- payload parsers ------------------------------------------------------
 
 def parse_series(payload: dict, as_of: AsOf) -> SeriesSnapshot:
-    s = _require(payload, "series", "series response")
+    s = _obj(_require(payload, "series", "series response"), "series")
     ctx = "series"
-    last = s.get("last_updated_ts") if isinstance(s, dict) else None
+    last = s.get("last_updated_ts")
     return SeriesSnapshot(
         ticker=_nonempty_str(_require(s, "ticker", ctx), "series.ticker"),
         fee_type=_fee_type(_require(s, "fee_type", ctx), "series.fee_type"),
@@ -308,7 +322,7 @@ def _optional_override(obj: dict, key: str, parse: Callable[[Any, str], Any],
 
 
 def parse_event(payload: dict, as_of: AsOf) -> EventSnapshot:
-    e = _require(payload, "event", "event response")
+    e = _obj(_require(payload, "event", "event response"), "event")
     ctx = "event"
     t, tf = _optional_override(e, "fee_type_override", _fee_type, ctx)
     m, mf = _optional_override(e, "fee_multiplier_override", _multiplier, ctx)
@@ -354,18 +368,20 @@ def parse_event_fee_change_pages(pages: Sequence[dict], as_of: AsOf) -> EventCha
     return EventChangeList(tuple(out), as_of)
 
 
-def parse_market(market: dict) -> MarketFeeInfo:
+def parse_market(market: dict, as_of: AsOf) -> MarketFeeInfo:
     """A single market object (the value of `market`, or one element of
-    `markets`)."""
+    `markets`), with the timing of the response it came from."""
     ctx = "market"
+    _obj(market, ctx)
+    if not isinstance(as_of, AsOf):
+        raise FeeMetadataError("market: as_of must be an AsOf")
     w, wf = _optional_override(
-        market if isinstance(market, dict) else {}, "fee_waiver_expiration_time",
-        lambda v, c: parse_ts(v, c), ctx,
+        market, "fee_waiver_expiration_time", lambda v, c: parse_ts(v, c), ctx,
     )
     return MarketFeeInfo(
         ticker=_nonempty_str(_require(market, "ticker", ctx), "market.ticker"),
         event_ticker=_nonempty_str(_require(market, "event_ticker", ctx), "market.event_ticker"),
-        waiver_expiry=w, waiver_field=wf,
+        waiver_expiry=w, waiver_field=wf, as_of=as_of,
     )
 
 
@@ -457,7 +473,14 @@ def resolve_fee_schedule(
 
     s_changes = [c for c in series_changes.changes if c.series_ticker == series.ticker]
     e_changes = [c for c in event_changes.changes if c.event_ticker == event.event_ticker]
+    for c in e_changes:
+        if c.series_ticker != event.series_ticker:
+            raise FeeMetadataError(
+                f"event fee change {c.id!r} names series {c.series_ticker!r} but event "
+                f"{event.event_ticker!r} belongs to {event.series_ticker!r}"
+            )
     inputs = {
+        "market": market.as_of,
         "series": series.as_of, "series_changes": series_changes.as_of,
         "event": event.as_of, "event_changes": event_changes.as_of,
     }
@@ -481,6 +504,10 @@ def resolve_fee_schedule(
     stale = sorted(k for k, a in inputs.items() if at > a.hi + ttl)
     if stale:
         return out(UNAVAILABLE, "stale:" + ",".join(stale))
+    # Market metadata has no change feed: it is only known from its own
+    # observation window onward.
+    if at < market.as_of.lo:
+        return out(UNAVAILABLE, "before_snapshot:market")
     if not series_changes.include_historical:
         return out(UNAVAILABLE, "change_history_required")
 

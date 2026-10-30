@@ -70,8 +70,8 @@ def event_changes(*pages, as_of=AS_OF):
     return fs.parse_event_fee_change_pages([J(p) for p in pages], as_of)
 
 
-def market(ticker, event_ticker, **extra):
-    return fs.parse_market({"ticker": ticker, "event_ticker": event_ticker, **extra})
+def market(ticker, event_ticker, as_of=AS_OF, **extra):
+    return fs.parse_market({"ticker": ticker, "event_ticker": event_ticker, **extra}, as_of)
 
 
 def resolve(*, s=None, sc=None, e=None, ec=None, m=None, role=TAKER, at=AT, ttl=TTL):
@@ -123,7 +123,7 @@ def test_observed_historical_change_before_window_is_ignored():
 
 
 def test_observed_market_waiver_field_omitted():
-    m = fs.parse_market(OBS_MARKET_BTC15M)
+    m = fs.parse_market(OBS_MARKET_BTC15M, AS_OF)
     assert m.waiver_expiry is None and m.waiver_field == "omitted"
 
 
@@ -289,6 +289,11 @@ def test_at_inside_window_without_changes_uses_snapshot():
 
 def test_before_snapshot_fails_closed():
     r = resolve(at=AS_OF.lo - timedelta(seconds=1))
+    assert r.status == UNAVAILABLE and r.reason.startswith("before_snapshot:")
+    # With market timing out of the way, the series window is what blocks it.
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700",
+               as_of=AsOf(AS_OF.lo - timedelta(minutes=1), AS_OF.hi))
+    r = resolve(m=m, at=AS_OF.lo - timedelta(seconds=1))
     assert (r.status, r.reason) == (UNAVAILABLE, "before_snapshot:series")
 
 
@@ -446,8 +451,8 @@ def _raw_btc15m(role):
     e = fs.parse_event(ev_payload, _raw_as_of("event-btc15m.json"))
     ec = fs.parse_event_fee_change_pages([_raw("event-fee-changes.json")],
                                          _raw_as_of("event-fee-changes.json"))
-    m = fs.parse_market(_raw("markets-btc15m.json")["markets"][0])
-    at = max(x.as_of.hi for x in (s, sc, e, ec)) + timedelta(seconds=1)
+    m = fs.parse_market(_raw("markets-btc15m.json")["markets"][0], _raw_as_of("markets-btc15m.json"))
+    at = max(x.as_of.hi for x in (s, sc, e, ec, m)) + timedelta(seconds=1)
     return fs.resolve_fee_schedule(market=m, series=s, series_changes=sc, event=e,
                                    event_changes=ec, role=role, at=at, ttl=TTL), e, m
 
@@ -495,3 +500,90 @@ def test_raw_default_series_changes_empty():
 def test_raw_404_is_not_a_series():
     with pytest.raises(FeeMetadataError):
         fs.parse_series(_raw("series-kxmve.json"), _raw_as_of("series-kxmve.json"))
+
+
+# ---- review fixes for 201723c ---------------------------------------------
+
+def test_event_change_with_mismatched_parent_series_raises():
+    # Codex repro: a BTC event change naming KXETH15M with multiplier 0 used to
+    # yield EXPLICIT_ZERO. SYNTHETIC.
+    bad = ('{"id":"x","event_ticker":"KXBTC15M-26OCT300700","series_ticker":"KXETH15M",'
+           '"fee_type_override":null,"fee_multiplier_override":0,'
+           f'"scheduled_ts":"{_iso(T0 + timedelta(seconds=20))}"}}')
+    with pytest.raises(FeeMetadataError):
+        resolve(ec=event_changes('{"cursor":"","event_fee_changes":[' + bad + ']}'))
+
+
+def test_changes_for_other_events_still_ignored():
+    other = _ev_change("o1", _iso(T0 + timedelta(seconds=20)), m="0", ev="KXBTC15M-OTHER")
+    r = resolve(ec=event_changes('{"cursor":"","event_fee_changes":[' + other + ']}'))
+    assert r.coefficient == D("0.07")
+
+
+OLD = AsOf(T0 - timedelta(hours=3), T0 - timedelta(hours=3) + timedelta(seconds=5))
+
+
+@pytest.mark.parametrize("extra", [
+    {},                                                             # omitted waiver field
+    {"fee_waiver_expiration_time": None},                           # null
+    {"fee_waiver_expiration_time": "2026-10-01T00:00:00Z"},         # expired
+])
+def test_stale_market_metadata_is_unavailable(extra):
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700", as_of=OLD, **extra)
+    r = resolve(m=m)
+    assert (r.status, r.reason) == (UNAVAILABLE, "stale:market")
+    assert r.coefficient is None
+
+
+def test_market_timing_in_provenance_and_validity():
+    early = AsOf(AS_OF.lo, AS_OF.hi - timedelta(seconds=1))
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700", as_of=early)
+    r = resolve(m=m)
+    assert r.provenance["as_of"]["market"] == (early.lo, early.hi)
+    assert r.valid_until == early.hi + TTL
+
+
+def test_before_market_observation_window_is_unavailable():
+    late = AsOf(AS_OF.lo + timedelta(seconds=20), AS_OF.hi)
+    m = market("KXBTC15M-26OCT300700-00", "KXBTC15M-26OCT300700", as_of=late)
+    r = resolve(m=m, at=AS_OF.lo + timedelta(seconds=10))
+    assert (r.status, r.reason) == (UNAVAILABLE, "before_snapshot:market")
+
+
+def test_parse_market_requires_as_of():
+    with pytest.raises(FeeMetadataError):
+        fs.parse_market({"ticker": "T", "event_ticker": "E"}, None)
+
+
+_MALFORMED = [None, 7, "x", [], True, {"unexpected": 1}]
+
+
+@pytest.mark.parametrize("inner", _MALFORMED)
+def test_malformed_payloads_raise_only_fee_metadata_error(inner):
+    calls = [
+        lambda: fs.parse_series({"series": inner}, AS_OF),
+        lambda: fs.parse_series(inner, AS_OF),
+        lambda: fs.parse_event({"event": inner}, AS_OF),
+        lambda: fs.parse_event(inner, AS_OF),
+        lambda: fs.parse_market(inner, AS_OF),
+        *([] if inner == [] else [   # [] is a valid empty change list
+            lambda: fs.parse_series_fee_changes({"series_fee_change_arr": inner}, AS_OF,
+                                                include_historical=True)]),
+        lambda: fs.parse_series_fee_changes({"series_fee_change_arr": [inner]}, AS_OF,
+                                            include_historical=True),
+        lambda: fs.parse_event_fee_change_pages([inner], AS_OF),
+        lambda: fs.parse_event_fee_change_pages(
+            [{"cursor": "", "event_fee_changes": [inner]}], AS_OF),
+    ]
+    for call in calls:
+        with pytest.raises(FeeMetadataError):
+            call()
+
+
+@pytest.mark.parametrize("text", ["{", "", "[1,", b"\xff\xfe", "{\"a\": -Infinity}", 5, None,
+                                  "[" * 100000])
+def test_loads_errors_are_fee_metadata_errors(text):
+    with pytest.raises(FeeMetadataError) as exc:
+        fs.loads(text)
+    if isinstance(text, (str, bytes)) and text not in ('{"a": -Infinity}',):
+        assert exc.value.__cause__ is not None
