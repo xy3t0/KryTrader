@@ -277,6 +277,32 @@ class FeeMetadataCapturer:
     async def market(self, ticker: str, *, batch_id: str, context: Optional[dict] = None):
         return await self.capture(f"/markets/{_ticker(ticker)}", batch_id=batch_id, context=context)
 
+    async def open_markets(self, series_ticker: str, *, batch_id: str,
+                           context: Optional[dict] = None, limit: int = 20):
+        """Open markets of one series (single page; callers needing all pages
+        must check the returned cursor)."""
+        if not (1 <= limit <= 1000):
+            raise FeeCaptureError("limit must be in 1..1000")
+        return await self.capture("/markets", {"series_ticker": _ticker(series_ticker),
+                                               "status": "open", "limit": str(limit)},
+                                  batch_id=batch_id, context=context)
+
+    def record_external(self, *, url: str, request_sent: datetime, response_received: datetime,
+                        status: int, body: bytes, batch_id: str,
+                        context: Optional[dict] = None) -> CaptureRecord:
+        """Store a non-Kalshi response (e.g. price candles) as evidence with
+        the same guarantees: content-addressed body, appended record."""
+        if not isinstance(body, (bytes, bytearray)):
+            raise FeeCaptureError("body must be bytes")
+        digest = self.store.put_body(bytes(body))
+        rec = CaptureRecord(
+            capture_id=uuid.uuid4().hex, batch_id=batch_id, url=url, params=(),
+            request_sent=request_sent, response_received=response_received, status=int(status),
+            date_header=None, age_header=None, cache_control=None, body_sha256=digest,
+            body_size=len(body), context=dict(context or {}))
+        self.store.append(rec)
+        return rec
+
     async def event_fee_changes(self, *, event_ticker: Optional[str], limit: int = 1000,
                                 batch_id: str, context: Optional[dict] = None,
                                 max_pages: int = MAX_EVENT_CHANGE_PAGES):

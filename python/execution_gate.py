@@ -51,6 +51,10 @@ class ExecutionIntent:
     side_probability: Any  # model probability that `side` wins (float allowed; converted exactly)
     decided_at: datetime
     fee_context: fctx.FeeContext
+    # Contexts for later instants the order can execute at (e.g. arrival after
+    # latency). The fee bound uses the largest coefficient over all of them,
+    # so a fee change during latency stays inside the reservation.
+    fee_envelope: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -96,14 +100,23 @@ def admit(conn, intent: ExecutionIntent, *, min_net_edge_per_contract: Any,
     ctx = intent.fee_context
     if not isinstance(ctx, fctx.FeeContext) or not ctx.usable or ctx.resolution is None:
         return no(f"fee_context_unusable:{getattr(ctx, 'reason', '?')}")
-    if ctx.policy != policy:
-        return no("fee_context_policy_mismatch")
-    res = ctx.resolution
-    if res.market_ticker != intent.ticker or res.role != intent.role:
-        return no("fee_context_identity_mismatch")
     decided = intent.decided_at.astimezone(timezone.utc)
-    if res.at != decided or ctx.valid_until is None or decided > ctx.valid_until:
+    res = ctx.resolution
+    if res.at != decided:
         return no("fee_context_not_for_this_instant")
+    for c in (ctx, *intent.fee_envelope):
+        if not isinstance(c, fctx.FeeContext) or not c.usable or c.resolution is None:
+            return no(f"fee_context_unusable:{getattr(c, 'reason', '?')}")
+        if c.policy != policy:
+            return no("fee_context_policy_mismatch")
+        r = c.resolution
+        if r.market_ticker != intent.ticker or r.role != intent.role:
+            return no("fee_context_identity_mismatch")
+        if r.at < decided or c.valid_until is None or r.at > c.valid_until:
+            return no("fee_context_not_for_this_instant")
+        if c.precision != ctx.precision or c.account_id != ctx.account_id:
+            return no("fee_context_account_mismatch")
+    coefficient = max(Fraction(c.resolution.coefficient) for c in (ctx, *intent.fee_envelope))
     try:
         lim = fees.to_fraction(intent.limit, "limit")
         cnt = fees.to_fraction(intent.count, "count")
@@ -117,7 +130,7 @@ def admit(conn, intent: ExecutionIntent, *, min_net_edge_per_contract: Any,
     if lim > cap:
         return no("limit_above_cap")
     try:
-        bound = fee_bound(count=cnt, limit=lim, coefficient=Fraction(res.coefficient),
+        bound = fee_bound(count=cnt, limit=lim, coefficient=coefficient,
                           precision=Fraction(ctx.precision))
     except GateError as e:
         return no(f"bad_input:{e}")

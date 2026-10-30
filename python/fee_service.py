@@ -255,6 +255,56 @@ class FeeMetadataService:
                 pass
 
 
+def evidence_of(snaps: dict) -> dict:
+    """Capture ids behind a gathered snapshot set (JSON-serialisable)."""
+    return {"market": snaps["market"].record.capture_id,
+            "event": snaps["event"].record.capture_id,
+            "series": snaps["series"].record.capture_id,
+            "series_changes": snaps["series_changes"].record.capture_id,
+            "event_changes": [p.record.capture_id for p in snaps["event_changes"].pages]}
+
+
+def evidence_tuple(ev: dict) -> tuple[str, ...]:
+    return (ev["market"], ev["event"], ev["series"], ev["series_changes"], *ev["event_changes"])
+
+
+def snapshots_from_evidence(service: "FeeMetadataService", ev: dict) -> dict:
+    """Rebuild a snapshot set from stored captures, re-running the same skew
+    and cache checks. Deterministic: the same evidence always rebuilds the
+    same snapshots. Raises FeeServiceError if anything is missing/corrupt."""
+    store = service.capturer.store
+    try:
+        def one(cid):
+            rec, body = store.get(cid)
+            return service._snapshot(rec, body)
+        pages = tuple(one(c) for c in ev["event_changes"])
+        if not pages:
+            raise FeeServiceError("no event change pages in evidence")
+        return {"market": one(ev["market"]), "event": one(ev["event"]),
+                "series": one(ev["series"]), "series_changes": one(ev["series_changes"]),
+                "event_changes": ListingSnapshot(pages, fs.AsOf(min(p.as_of.lo for p in pages),
+                                                                max(p.as_of.hi for p in pages)))}
+    except (KeyError, TypeError) as e:
+        raise FeeServiceError(f"malformed evidence: {e}") from e
+    except fcap.FeeCaptureError as e:
+        raise FeeServiceError(str(e)) from e
+
+
+def context_from_snapshots(service: "FeeMetadataService", conn, snaps: dict, *, kalshi_env: str,
+                           account_id: str, policy: str, role: str,
+                           at: datetime) -> fctx.FeeContext:
+    """A FeeContext from an already-gathered (or rebuilt) snapshot set."""
+    try:
+        return fctx.build_fee_context(conn, kalshi_env=kalshi_env, account_id=account_id,
+                                      policy=policy, role=role, at=at, ttl=service.ttl,
+                                      evidence=evidence_tuple(evidence_of(snaps)),
+                                      **parse_snapshots(snaps))
+    except fs.FeeMetadataError as e:
+        return fctx.FeeContext(kalshi_env, account_id, None, Decimal(0), "", policy, None,
+                               evidence_tuple(evidence_of(snaps)), None, False,
+                               f"metadata_unavailable:{e}")
+
+
 def parse_snapshots(snaps: dict) -> dict:
     """Parse stored snapshots into resolver inputs. Coverage starts as NONE;
     the policy in fee_context decides what coverage, if any, applies. Pure:
