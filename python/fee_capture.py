@@ -33,7 +33,15 @@ MAX_EVENT_CHANGE_PAGES = 200
 
 
 class FeeCaptureError(RuntimeError):
-    """A capture could not be made, stored, or trusted."""
+    """A capture could not be made, stored, or trusted. `status` and
+    `retry_after` are set when the cause was a recorded HTTP response."""
+
+    def __init__(self, message: str, *, status: Optional[int] = None,
+                 retry_after: Optional[str] = None, capture_id: Optional[str] = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+        self.capture_id = capture_id
 
 
 @dataclass(frozen=True)
@@ -250,7 +258,9 @@ class FeeMetadataCapturer:
         )
         self.store.append(rec)
         if rec.status != 200:
-            raise FeeCaptureError(f"{url} returned HTTP {rec.status} (capture {rec.capture_id})")
+            raise FeeCaptureError(f"{url} returned HTTP {rec.status} (capture {rec.capture_id})",
+                                  status=rec.status, capture_id=rec.capture_id,
+                                  retry_after=_header(resp.headers, "Retry-After"))
         return rec, body
 
     async def series(self, ticker: str, *, batch_id: str, context: Optional[dict] = None):
