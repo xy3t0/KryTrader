@@ -274,7 +274,9 @@ def test_decide_gates():
     assert rx.decide(inputs(), st, **{**kw, "attempted": True}).reason == "already_attempted_this_event"
     assert rx.decide(inputs(), st, **{**kw, "open_positions": 1}).reason == "position_limit"
     assert rx.decide(inputs(), st, **{**kw, "quarantined": True}).reason == "primary_scenario_quarantined"
-    assert rx.decide(inputs(), None, **kw).reason == "no_book_or_no_ask"
+    assert rx.decide(inputs(), None, **kw).reason == "no_book"
+    import dataclasses
+    assert rx.decide(inputs(), dataclasses.replace(st, no=()), **kw).reason == "no_ask"
     assert rx.decide(inputs(), book(no_bid="0.01").state_at(NOW), **kw).reason == "ask_above_cap"
 
 

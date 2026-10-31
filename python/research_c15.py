@@ -616,9 +616,11 @@ def decide(inp: MarketInputs, book: Optional[sim_exec.BookState], *, open_positi
     prob = up if side == "yes" else 1.0 - up
     if Fraction(prob) < Fraction(p["min_side_probability"]):
         return Decision(False, "probability_below_threshold", side, prob)
+    if book is None:          # no live, liveness-confirmed book at this instant
+        return Decision(False, "no_book", side, prob)
     ask = best_ask(book, side)
-    if ask is None:
-        return Decision(False, "no_book_or_no_ask", side, prob)
+    if ask is None:           # book live, but nobody is selling this side
+        return Decision(False, "no_ask", side, prob)
     if ask > Fraction(p["max_limit"]):
         return Decision(False, "ask_above_cap", side, prob)
     return Decision(True, "eligible", side, prob, _dec(ask))

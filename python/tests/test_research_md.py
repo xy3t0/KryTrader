@@ -268,3 +268,28 @@ def test_missing_key_reported_not_crashing():
                             connect=lambda u, h: FakeWS(), clock=Clock())
     asyncio.run(run_for(c, 0.05))
     assert c.last_error == "no saved Kalshi API key" and not c.connected
+
+
+def test_monotonic_clock_never_steps_back():
+    """kalshi_auth re-syncs its offset every few minutes; a backward step must
+    not reorder receipt stamps (BookStream refuses out-of-order events)."""
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 10, 30, 22, 28, 8, tzinfo=timezone.utc)
+    seq = iter([t0, t0 - timedelta(seconds=0.5), t0 + timedelta(seconds=0.2),
+                t0 + timedelta(seconds=1)])
+    clk = md.MonotonicClock(lambda: next(seq))
+    out = [clk() for _ in range(4)]
+    assert out == [t0, t0, t0 + timedelta(seconds=0.2), t0 + timedelta(seconds=1)]
+    assert all(a <= b for a, b in zip(out, out[1:]))
+
+
+def test_experiment_shares_the_monotonic_clock(monkeypatch):
+    from datetime import datetime, timezone
+    import research_c15_live
+    clk = md._server_now
+    assert isinstance(clk, md.MonotonicClock)
+    assert md.MarketDataClient.__init__.__kwdefaults__["clock"] is clk
+    t = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(clk, "base", lambda: t)
+    monkeypatch.setattr(clk, "last", None)
+    assert research_c15_live.server_now() == t and clk.last == t

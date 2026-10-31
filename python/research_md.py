@@ -44,9 +44,34 @@ def production_headers() -> dict:
     return kalshi_auth.sign_headers_with(key_id, pk, "GET", WS_PATH)
 
 
-def _server_now() -> datetime:
+class MonotonicClock:
+    """Kalshi-corrected time that never runs backwards. kalshi_auth re-measures
+    its offset every few minutes and the correction can step back by a second
+    or more; receipt stamps must stay ordered (BookStream refuses out-of-order
+    events, so a backward step dropped a delta live and made the window
+    recording unreplayable). After a backward step the clock holds until real
+    time catches up, so a stamp is late by at most the size of the step."""
+
+    def __init__(self, base: Callable[[], datetime]):
+        self.base = base
+        self.last: Optional[datetime] = None
+
+    def __call__(self) -> datetime:
+        t = self.base()
+        if self.last is not None and t < self.last:
+            return self.last
+        self.last = t
+        return t
+
+
+def _raw_server_now() -> datetime:
     import kalshi_auth
     return datetime.fromtimestamp(kalshi_auth.server_now(), timezone.utc)
+
+
+# One clock for the whole experiment process: socket receipt stamps, decisions
+# and captures all compare against each other.
+_server_now = MonotonicClock(_raw_server_now)
 
 
 class MarketDataClient:

@@ -49,8 +49,9 @@ CANDLE_LOOKBACK_MIN = 90
 
 
 def server_now() -> datetime:
-    import kalshi_auth
-    return datetime.fromtimestamp(kalshi_auth.server_now(), timezone.utc)
+    """The experiment's shared, never-decreasing Kalshi clock (research_md)."""
+    import research_md
+    return research_md._server_now()
 
 
 def default_spot_reads(cf_state) -> list[tuple[str, float, float]]:
