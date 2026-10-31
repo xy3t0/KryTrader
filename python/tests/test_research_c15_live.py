@@ -152,6 +152,21 @@ def test_decision_time_is_taken_after_delayed_metadata(env):
                                              inp.candles_received_at))
 
 
+def test_no_decision_while_the_clock_is_far_from_kalshi_time(env):
+    """ElapsedClock reports how far its timeline is from measured Kalshi time;
+    beyond the bound the experiment refuses to decide (recorded as downtime
+    by the loop) and readiness refuses to launch."""
+    conn, clock, spot, tmp = env
+    x = experiment(conn, clock, spot, tmp)
+    clock.error_s = live.MAX_CLOCK_ERROR_S + 0.5
+    with pytest.raises(rx.ExperimentError, match="clock"):
+        run(x.make_inputs())
+    ok, why = run(x.readiness())
+    assert not ok and why.startswith("clock")
+    clock.error_s = -(live.MAX_CLOCK_ERROR_S - 0.5)
+    assert run(x.make_inputs()) is not None
+
+
 def test_value_stamped_after_decision_is_never_used(env):
     conn, clock, spot, tmp = env
     spot["reads"] = [("coinbase_ws", (clock() + timedelta(seconds=3)).timestamp(), 99999.0)]
@@ -637,6 +652,33 @@ def test_unbound_or_disabled_switch_never_launches(env, monkeypatch, switch):
     asyncio.run(go())
     assert not _active(conn)
     assert conn.execute("SELECT COUNT(*) FROM rx_decisions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("bad", ["[]", "null", "true", "7"])
+def test_malformed_switch_disables_but_outstanding_orders_still_resolve(env, monkeypatch, bad):
+    """A non-object switch file means disabled (no crash): new entries stop,
+    and orders already placed are still resolved and settled."""
+    conn, clock, spot, tmp = env
+    import research_preflight as pf
+    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
+
+    def prints(close_e, now_e):
+        n = int(60 - (close_e - now_e))
+        return (77700.0 * n, n, "coinbase_proxy") if n > 0 else (0.0, 0, "none")
+    flipped = {"done": False}
+
+    def settled_after_flip(c):
+        if not flipped["done"] and c.execute("SELECT COUNT(*) FROM rx_orders").fetchone()[0]:
+            (pf.data_dir() / pf.SWITCH_NAME).write_text(bad)
+            assert not pf.experiment_enabled()
+            flipped["done"] = True
+        return flipped["done"] \
+            and c.execute("SELECT COUNT(*) FROM rx_orders WHERE state='pending'").fetchone()[0] == 0 \
+            and c.execute("SELECT COUNT(*) FROM rw_positions").fetchone()[0] == 0 \
+            and c.execute("SELECT COUNT(*) FROM rx_outcomes").fetchone()[0] >= 1
+    start_run(env, monkeypatch, spot_reads=fresh, prints=prints, start=CLOSE - timedelta(seconds=80),
+              step=timedelta(seconds=0.5), done=settled_after_flip)
+    assert conn.execute("SELECT COUNT(*) FROM rx_downtime").fetchone()[0] == 0
 
 
 def test_default_spot_and_print_sources_are_bound_to_the_experiment(env, monkeypatch):

@@ -44,24 +44,59 @@ def production_headers() -> dict:
     return kalshi_auth.sign_headers_with(key_id, pk, "GET", WS_PATH)
 
 
-class MonotonicClock:
-    """Kalshi-corrected time that never runs backwards. kalshi_auth re-measures
-    its offset every few minutes and the correction can step back by a second
-    or more; receipt stamps must stay ordered (BookStream refuses out-of-order
-    events, so a backward step dropped a delta live and made the window
-    recording unreplayable). After a backward step the clock holds until real
-    time catches up, so a stamp is late by at most the size of the step."""
+# ---- the experiment's clock ----------------------------------------------------
+#
+# Receipt stamps, decisions and latency arrivals are all compared on one
+# timeline. kalshi_auth re-measures its offset to Kalshi every few minutes and
+# the measured time can step back (or forward) by a second. Following those
+# steps reorders events (a backward step dropped deltas live); holding the
+# clock through them squeezes later events onto one stamp, so the book at an
+# arrival could contain a later removal or addition (review P1).
+#
+# ElapsedClock advances by monotonic elapsed time, so the gap between any two
+# stamps is exactly the real time between them. It is kept on Kalshi time by
+# slewing (at most SLEW_RATE seconds per second, never backwards) and ONLY
+# outside the protected part of each 15-minute window, which covers every
+# decision, latency arrival, fill grace and settlement. Inside it the 1/2/5 s
+# delays are exact elapsed time. `error_s` is how far the timeline is from
+# measured Kalshi time; callers refuse to decide when it exceeds a bound.
 
-    def __init__(self, base: Callable[[], datetime]):
-        self.base = base
-        self.last: Optional[datetime] = None
+SLEW_RATE = 0.0005                   # 500 ppm: 0.3 s of correction per window
+WINDOW_S = 900                       # 15-minute markets close on the quarter hour
+PROTECT_BEFORE_S = 240               # book window opens 150 s before close
+PROTECT_AFTER_S = 60                 # fill grace, settlement prints
+
+
+def in_protected_window(t: datetime) -> bool:
+    s = t.timestamp() % WINDOW_S
+    return s >= WINDOW_S - PROTECT_BEFORE_S or s < PROTECT_AFTER_S
+
+
+class ElapsedClock:
+    def __init__(self, target: Callable[[], datetime], *,
+                 mono: Callable[[], float] = time.monotonic, rate: float = SLEW_RATE,
+                 protected: Callable[[datetime], bool] = in_protected_window):
+        if not (0 <= rate < 1):
+            raise ValueError("rate must be in [0, 1)")
+        self.target, self.mono, self.rate, self.protected = target, mono, rate, protected
+        self._t: Optional[float] = None        # epoch seconds on the timeline
+        self._m: Optional[float] = None        # monotonic reading at _t
+        self.error_s = 0.0
 
     def __call__(self) -> datetime:
-        t = self.base()
-        if self.last is not None and t < self.last:
-            return self.last
-        self.last = t
-        return t
+        m = self.mono()
+        goal = self.target().timestamp()
+        if self._t is None:
+            self._t, self._m = goal, m
+        else:
+            dt = max(0.0, m - self._m)
+            t = self._t + dt
+            if not self.protected(datetime.fromtimestamp(t, timezone.utc)):
+                bound = self.rate * dt
+                t += min(bound, max(-bound, goal - t))
+            self._t, self._m = t, m
+        self.error_s = goal - self._t
+        return datetime.fromtimestamp(self._t, timezone.utc)
 
 
 def _raw_server_now() -> datetime:
@@ -71,7 +106,7 @@ def _raw_server_now() -> datetime:
 
 # One clock for the whole experiment process: socket receipt stamps, decisions
 # and captures all compare against each other.
-_server_now = MonotonicClock(_raw_server_now)
+_server_now = ElapsedClock(_raw_server_now)
 
 
 class MarketDataClient:

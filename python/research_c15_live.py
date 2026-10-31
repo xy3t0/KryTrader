@@ -48,8 +48,15 @@ DISCOVERY_REFRESH = timedelta(seconds=60)
 CANDLE_LOOKBACK_MIN = 90
 
 
+MAX_CLOCK_ERROR_S = 2.0      # timeline vs measured Kalshi time (research_md.ElapsedClock)
+
+
+def clock_error(clock) -> float:
+    return abs(getattr(clock, "error_s", 0.0) or 0.0)
+
+
 def server_now() -> datetime:
-    """The experiment's shared, never-decreasing Kalshi clock (research_md)."""
+    """The experiment's shared elapsed-time Kalshi clock (research_md)."""
     import research_md
     return research_md._server_now()
 
@@ -298,6 +305,9 @@ class LiveExperiment:
         await self.refresh_candles()
         # --- then the decision instant, and only synchronous reads ---
         decided = self.clock()
+        if clock_error(self.clock) > MAX_CLOCK_ERROR_S:
+            raise rx.ExperimentError(f"clock {self.clock.error_s:+.2f}s from Kalshi time; "
+                                     f"no decision (bound {MAX_CLOCK_ERROR_S}s)")
         offset = decided.timestamp() - self.local_time()
         mk = (fs.loads(snaps["market"].body) or {}).get("market") or {}
         ev = (fs.loads(snaps["event"].body) or {}).get("event") or {}
@@ -355,6 +365,9 @@ class LiveExperiment:
 
     async def readiness(self) -> tuple[bool, str]:
         """Launch gate: every feed the experiment needs is live right now."""
+        self.clock()
+        if clock_error(self.clock) > MAX_CLOCK_ERROR_S:
+            return False, f"clock {self.clock.error_s:+.2f}s from Kalshi time"
         if self.md is None or not self.md.connected:
             return False, f"market data not connected ({getattr(self.md, 'last_error', None)})"
         m = await self.current_market()

@@ -270,26 +270,145 @@ def test_missing_key_reported_not_crashing():
     assert c.last_error == "no saved Kalshi API key" and not c.connected
 
 
-def test_monotonic_clock_never_steps_back():
-    """kalshi_auth re-syncs its offset every few minutes; a backward step must
-    not reorder receipt stamps (BookStream refuses out-of-order events)."""
-    from datetime import datetime, timedelta, timezone
-    t0 = datetime(2026, 10, 30, 22, 28, 8, tzinfo=timezone.utc)
-    seq = iter([t0, t0 - timedelta(seconds=0.5), t0 + timedelta(seconds=0.2),
-                t0 + timedelta(seconds=1)])
-    clk = md.MonotonicClock(lambda: next(seq))
-    out = [clk() for _ in range(4)]
-    assert out == [t0, t0, t0 + timedelta(seconds=0.2), t0 + timedelta(seconds=1)]
-    assert all(a <= b for a, b in zip(out, out[1:]))
+# ---- elapsed-time clock (review P1) ------------------------------------------------
+
+import json as _json  # noqa: E402
+import random as _random  # noqa: E402
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+import sim_exec as _sx  # noqa: E402
+
+# 18:59:00Z: inside the protected part of the 19:00 window.
+_PROT = _dt(2026, 10, 30, 18, 59, 0, tzinfo=_tz.utc)
+# 18:50:00Z: outside it (slewing allowed).
+_FREE = _dt(2026, 10, 30, 18, 50, 0, tzinfo=_tz.utc)
 
 
-def test_experiment_shares_the_monotonic_clock(monkeypatch):
-    from datetime import datetime, timezone
+class _Sim:
+    """Monotonic seconds and a Kalshi-time target with injectable steps."""
+
+    def __init__(self, start):
+        self.m, self.start, self.step = 0.0, start, 0.0
+
+    def mono(self):
+        return self.m
+
+    def target(self):
+        return self.start + _td(seconds=self.m + self.step)
+
+
+def _clock(sim, **kw):
+    return md.ElapsedClock(sim.target, mono=sim.mono, **kw)
+
+
+def test_protected_window_covers_decisions_arrivals_and_settlement():
+    close = _dt(2026, 10, 30, 19, 0, tzinfo=_tz.utc)
+    for s in (-240, -150, -60, -1, 0, 5, 8, 59):
+        assert md.in_protected_window(close + _td(seconds=s)), s
+    for s in (-241, 60, 300, 600):
+        assert not md.in_protected_window(close + _td(seconds=s)), s
+
+
+@pytest.mark.parametrize("step", [-1.0, -3.0, +1.0])
+def test_offset_step_inside_window_keeps_exact_elapsed_time(step):
+    sim = _Sim(_PROT)
+    clk = _clock(sim)
+    stamps = []
+    for k in range(40):                       # 20 s at 0.5 s
+        if k == 7:
+            sim.step = step                   # re-measured offset jumps
+        stamps.append(clk())
+        sim.m += 0.5
+    gaps = [(b - a).total_seconds() for a, b in zip(stamps, stamps[1:])]
+    assert all(abs(g - 0.5) < 2e-6 for g in gaps)
+    assert abs(clk.error_s - step) < 1e-3     # the step is reported, not followed
+    for lat in (1, 2, 5):                     # the experiment's latency scenarios
+        k = lat * 2
+        assert abs((stamps[5 + k] - stamps[5]).total_seconds() - lat) < 2e-6
+
+
+def test_outside_window_slews_toward_kalshi_time_never_backwards():
+    sim = _Sim(_FREE)
+    clk = _clock(sim)
+    clk()
+    sim.step = -1.0
+    prev, m0 = clk(), sim.m
+    for _ in range(2400):                     # 240 s at 0.1 s, all outside the window
+        sim.m += 0.1
+        t = clk()
+        g = (t - prev).total_seconds()
+        assert 0.1 * (1 - md.SLEW_RATE) - 2e-6 <= g <= 0.1 * (1 + md.SLEW_RATE) + 2e-6
+        prev = t
+    assert abs(clk.error_s) < 1.0 - 0.9 * md.SLEW_RATE * (sim.m - m0)
+
+
+def test_never_decreases_under_noisy_offsets():
+    rnd = _random.Random(7)
+    sim = _Sim(_PROT - _td(minutes=3))
+    clk = _clock(sim)
+    prev = clk()
+    for _ in range(5000):
+        sim.m += rnd.uniform(0, 0.05)
+        if rnd.random() < 0.01:
+            sim.step = rnd.uniform(-2, 2)
+        t = clk()
+        assert t >= prev
+        prev = t
+
+
+def _snap(seq, no_levels):
+    return _json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": seq,
+                        "msg": {"market_ticker": "M", "yes_dollars_fp": [],
+                                "no_dollars_fp": no_levels}})
+
+
+def _delta(seq, price, delta):
+    return _json.dumps({"type": "orderbook_delta", "sid": 1, "seq": seq,
+                        "msg": {"market_ticker": "M", "side": "no",
+                                "price_dollars": price, "delta_fp": delta}})
+
+
+@pytest.mark.parametrize("delta,expect", [("-3.00", "3.00"),     # liquidity removed later
+                                          ("5.00", "3.00")])     # liquidity added later
+def test_backward_correction_cannot_move_a_later_change_into_an_arrival(delta, expect):
+    """Snapshot, decision, then Kalshi time is re-measured 1 s back just
+    before a depth change that really arrives 0.5 s AFTER the 1 s-latency
+    arrival. The arrival book must not contain it (held clocks stamped it at
+    the arrival instant)."""
+    sim = _Sim(_PROT)
+    clk = _clock(sim)
+    evs = []
+
+    def ev(kind, **kw):
+        evs.append({"t": clk().isoformat(), "kind": kind, "gen": 1, **kw})
+    ev("up")
+    ev("msg", raw=_snap(1, [["0.05", "3.00"]]))
+    for _ in range(4):
+        sim.m += 0.5
+        ev("alive")
+    decided = clk()                                   # m = 2.0
+    sim.m += 0.9
+    ev("alive")                                       # m = 2.9
+    sim.step = -1.0                                   # offset re-measured backwards
+    sim.m += 0.6
+    ev("msg", raw=_delta(2, "0.05", delta))           # m = 3.5, after arrival at 3.0
+    for _ in range(12):
+        sim.m += 0.5
+        ev("alive")
+    tape = _sx.BookTape.from_events("M", evs)
+    arrival = decided + _td(seconds=1)
+    st = tape.state_at(arrival, confirmed=True)
+    assert st is not None and dict(st.no) == {_sx._f("0.05", "p"): _sx._f(expect, "s")}
+    later = tape.state_at(decided + _td(seconds=2), confirmed=True)
+    assert dict(later.no) != dict(st.no)              # the change is real, just later
+
+
+def test_experiment_shares_the_elapsed_clock(monkeypatch):
     import research_c15_live
     clk = md._server_now
-    assert isinstance(clk, md.MonotonicClock)
+    assert isinstance(clk, md.ElapsedClock)
     assert md.MarketDataClient.__init__.__kwdefaults__["clock"] is clk
-    t = datetime(2026, 10, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(clk, "base", lambda: t)
-    monkeypatch.setattr(clk, "last", None)
-    assert research_c15_live.server_now() == t and clk.last == t
+    t = _dt(2026, 10, 30, tzinfo=_tz.utc)
+    monkeypatch.setattr(clk, "target", lambda: t)
+    monkeypatch.setattr(clk, "_t", None)
+    assert research_c15_live.server_now() == t and clk.error_s == 0.0

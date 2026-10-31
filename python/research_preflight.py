@@ -262,6 +262,8 @@ def read_switch() -> dict:
         return {"present": False, "enabled": False, "manifest_id": None}
     except Exception:
         return {"present": True, "enabled": False, "manifest_id": None}
+    if not isinstance(d, dict):           # [], null, true, 7 ... -> disabled
+        return {"present": True, "enabled": False, "manifest_id": None}
     mid = d.get("manifest_id")
     ok = (d.get("enabled") is True and isinstance(mid, str) and len(mid) == 64
           and all(c in "0123456789abcdef" for c in mid))

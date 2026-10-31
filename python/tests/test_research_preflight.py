@@ -42,7 +42,8 @@ def test_switch_defaults_to_disabled(data):
     assert pf.read_switch() == {"present": False, "enabled": False, "manifest_id": None}
     assert not pf.experiment_enabled()
     for bad in ("{not json", json.dumps({"enabled": "yes", "manifest_id": MID}),
-                json.dumps({"enabled": True}), json.dumps({"enabled": True, "manifest_id": "abc"})):
+                json.dumps({"enabled": True}), json.dumps({"enabled": True, "manifest_id": "abc"}),
+                "[]", "null", "true", "7", json.dumps([{"enabled": True, "manifest_id": MID}])):
         (data / pf.SWITCH_NAME).write_text(bad)
         assert pf.read_switch()["present"] and not pf.experiment_enabled()
 
