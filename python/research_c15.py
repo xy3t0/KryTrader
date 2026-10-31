@@ -94,14 +94,16 @@ ANALYSIS_SPEC = {
 
 REQUIRED_RUNTIME = {
     "app_mode": "paper",
-    "config": {"research_c15_enabled": True, "crypto15m_spot_ws": True},
+    "switch": "research_c15.json enabled and bound to this manifest by a passing preflight",
+    "config": {"crypto15m_spot_ws": True},
     "kalshi_key": "production key saved (read-only market data use)",
 }
 
 HASHED_FILES = (
     "fees.py", "fee_schedule.py", "fee_capture.py", "fee_ledger.py", "fee_context.py",
     "fee_service.py", "research_wallet.py", "execution_gate.py", "sim_exec.py",
-    "research_c15.py", "research_c15_live.py", "research_md.py", "crypto15m.py",
+    "research_c15.py", "research_c15_live.py", "research_md.py", "research_preflight.py",
+    "crypto15m.py",
     "indicators.py", "cf_ws.py", "spot_ws.py", "kalshi_auth.py", "ws_ssl.py",
     "requirements.txt",
 )

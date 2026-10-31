@@ -15,8 +15,12 @@ Checks (all REQUIRED unless marked WARN):
   * forced reconnect: new generation, fresh snapshot, book usable again
   * Coinbase spot feed fresh; Hyperliquid candles valid
   * CF index frames on the research socket (WARN: proxy fallback exists)
-A JSON report is written to <app data>/data/research_preflight.json; the
-`--research-enable` switch refuses unless a passing report is < 24 h old.
+A JSON report is written to <app data>/data/research_preflight.json, bound to
+the experiment manifest it checked. `--research-enable` refuses unless a
+passing report for the CURRENT manifest is between 0 and 24 h old, and the
+switch it writes names that manifest. The switch is the only on/off control:
+the app runs the experiment only while the switch is enabled for the running
+manifest (a code change needs a new preflight). `--research-disable` always wins.
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ from pathlib import Path
 REPORT_NAME = "research_preflight.json"
 SWITCH_NAME = "research_c15.json"
 MAX_REPORT_AGE = timedelta(hours=24)
+MAX_REPORT_FUTURE = timedelta(seconds=60)   # clock jitter; anything later is refused
 
 
 def default_user_data() -> Path:
@@ -59,6 +64,7 @@ def data_dir() -> Path:
 class Report:
     def __init__(self):
         self.items: list[dict] = []
+        self.manifest_id: str | None = None
 
     def add(self, name: str, ok: bool, detail: str = "", required: bool = True) -> bool:
         self.items.append({"check": name, "ok": bool(ok), "required": required, "detail": detail})
@@ -80,6 +86,19 @@ async def _wait(cond, timeout: float, step: float = 0.25) -> bool:
     return bool(cond())
 
 
+def clock_check(kalshi_auth) -> tuple[bool, str]:
+    """A fresh Kalshi clock measurement, never the cached offset that
+    sync_server_time returns when its request fails."""
+    try:
+        asked = time.time()
+        offset = kalshi_auth.sync_server_time(force=True)
+    except Exception as e:
+        return False, str(e)
+    if kalshi_auth.last_sync_ok_at < asked:
+        return False, "clock sync failed; refusing a cached offset"
+    return True, f"{offset} ms (decisions use Kalshi time)"
+
+
 async def run_preflight() -> Report:
     ensure_user_data()
     import cf_ws
@@ -96,14 +115,11 @@ async def run_preflight() -> Report:
     have_key = kalshi_auth.credentials_present(kalshi_auth.PRODUCTION)
     if not r.add("Kalshi API key saved", have_key, "" if have_key else "add it in the app: API Keys"):
         return r
-    try:
-        offset = kalshi_auth.sync_server_time(force=True)
-        r.add("Kalshi clock offset measured", True, f"{offset} ms (decisions use Kalshi time)")
-    except Exception as e:
-        r.add("Kalshi clock offset measured", False, str(e))
+    r.add("Kalshi clock offset measured", *clock_check(kalshi_auth))
     try:
         body = rx.manifest_body()
-        r.add("Experiment manifest", True, f"{rx.manifest_id(body)[:16]} ({body['code']['mode']})")
+        r.manifest_id = rx.manifest_id(body)
+        r.add("Experiment manifest", True, f"{r.manifest_id[:16]} ({body['code']['mode']})")
     except Exception as e:
         r.add("Experiment manifest", False, str(e))
 
@@ -223,8 +239,9 @@ async def run_preflight() -> Report:
 
 def write_report(r: Report) -> Path:
     p = data_dir() / REPORT_NAME
-    p.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "passed": r.passed,
-                             "items": r.items}, indent=1))
+    p.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(),
+                             "passed": r.passed and r.manifest_id is not None,
+                             "manifest_id": r.manifest_id, "items": r.items}, indent=1))
     return p
 
 
@@ -238,27 +255,63 @@ def main() -> int:
 # ---- switch -------------------------------------------------------------------
 
 def read_switch() -> dict:
-    """{"enabled": bool, "activate": str|None}; missing/invalid -> disabled."""
+    """{"present", "enabled", "manifest_id"}. Missing or invalid -> disabled."""
     try:
         d = json.loads((data_dir() / SWITCH_NAME).read_text())
-        return {"enabled": d.get("enabled") is True,
-                "activate": d.get("activate") if isinstance(d.get("activate"), str) else None}
+    except FileNotFoundError:
+        return {"present": False, "enabled": False, "manifest_id": None}
     except Exception:
-        return {"enabled": False, "activate": None}
+        return {"present": True, "enabled": False, "manifest_id": None}
+    mid = d.get("manifest_id")
+    ok = (d.get("enabled") is True and isinstance(mid, str) and len(mid) == 64
+          and all(c in "0123456789abcdef" for c in mid))
+    return {"present": True, "enabled": ok, "manifest_id": mid if ok else None}
 
 
-def set_switch(enabled: bool, activate=None) -> int:
+def experiment_enabled(manifest_id: str | None = None) -> bool:
+    """The single on/off rule. Enabled only by the switch file, and (when the
+    running manifest is given) only for the manifest the switch names."""
+    s = read_switch()
+    return s["enabled"] and (manifest_id is None or s["manifest_id"] == manifest_id)
+
+
+def check_report(report: dict, current_manifest: str, now: datetime) -> str | None:
+    """None if the report may enable the switch, else the reason it may not."""
+    try:
+        at = datetime.fromisoformat(report["at"])
+        if at.tzinfo is None:
+            return "report time has no timezone"
+    except Exception:
+        return "report unreadable"
+    if report.get("passed") is not True:
+        return "report did not pass"
+    if at - now > MAX_REPORT_FUTURE:
+        return "report is dated in the future"
+    if now - at >= MAX_REPORT_AGE:
+        return "report is older than 24 h"
+    if report.get("manifest_id") != current_manifest:
+        return "report was made for a different build/manifest"
+    return None
+
+
+def set_switch(enabled: bool) -> int:
     ensure_user_data()
-    if enabled:
-        try:
-            rep = json.loads((data_dir() / REPORT_NAME).read_text())
-            at = datetime.fromisoformat(rep["at"])
-            ok = rep.get("passed") is True and datetime.now(timezone.utc) - at < MAX_REPORT_AGE
-        except Exception:
-            ok = False
-        if not ok:
-            print("Refusing: run --research-preflight first (needs a PASSED report < 24 h old).")
-            return 1
-    (data_dir() / SWITCH_NAME).write_text(json.dumps({"enabled": enabled, "activate": activate}))
-    print(f"Research experiment {'ENABLED' if enabled else 'DISABLED'}. Restart the app to apply.")
+    path = data_dir() / SWITCH_NAME
+    if not enabled:
+        path.write_text(json.dumps({"enabled": False}))
+        print("Research experiment DISABLED. Restart the app to apply.")
+        return 0
+    import research_c15 as rx
+    try:
+        mid = rx.manifest_id(rx.manifest_body())
+        rep = json.loads((data_dir() / REPORT_NAME).read_text())
+        why = check_report(rep, mid, datetime.now(timezone.utc))
+    except Exception as e:
+        why = f"cannot check report ({e})"
+    if why:
+        print(f"Refusing: {why}. Run --research-preflight with this build first.")
+        return 1
+    path.write_text(json.dumps({"enabled": True, "manifest_id": mid,
+                                "at": datetime.now(timezone.utc).isoformat()}))
+    print(f"Research experiment ENABLED for manifest {mid[:16]}. Restart the app to apply.")
     return 0

@@ -416,10 +416,37 @@ class SettlingKalshi(Kalshi):
         return await super().__call__(url, params)
 
 
-def start_run(env, monkeypatch, *, spot_reads, start, real_s=0.4, step=None, prints=None):
+def enable_switch(manifest_id=None):
+    """What --research-enable writes after a passing preflight for this build."""
+    import research_preflight as pf
+    mid = manifest_id or rx.manifest_id(rx.manifest_body())
+    (pf.data_dir() / pf.SWITCH_NAME).write_text(json.dumps({"enabled": True, "manifest_id": mid}))
+    return mid
+
+
+async def until(cond, *, timeout=30.0, min_s=0.0):
+    """Wait for an explicit terminal condition (not a fixed wall-clock sleep);
+    min_s keeps negative tests running long enough to have had the chance."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while True:
+        elapsed = loop.time() - start
+        if elapsed >= min_s and cond():
+            return True
+        if elapsed >= timeout:
+            return False
+        await asyncio.sleep(0.01)
+
+
+def start_run(env, monkeypatch, *, spot_reads, start, real_s=0.4, step=None, prints=None,
+              done=None, enabled=True):
+    """Run the experiment until `done(conn)` holds (asserted), or for real_s
+    when no terminal condition applies (negative tests)."""
     conn, clock, spot, tmp = env
     import kalshi_auth
     monkeypatch.setattr(kalshi_auth, "is_paper", lambda env=None: True)
+    if enabled:
+        enable_switch()
     clock.t = start
 
     async def go():
@@ -431,15 +458,20 @@ def start_run(env, monkeypatch, *, spot_reads, start, real_s=0.4, step=None, pri
                 clock.t += step
         adv = asyncio.ensure_future(advance())
         task = asyncio.ensure_future(live.run(
-            lambda: {"research_c15_enabled": True}, stop,
+            lambda: {}, stop,
             make_md=lambda on_event, on_cf: FakeMD(on_event, clock), send=SettlingKalshi(clock),
             candle_post=candles(clock), clock=clock, spot_reads=spot_reads,
             prints=prints or (lambda c, n: (0.0, 0, "none")),
             local_time=lambda: clock().timestamp(), tick_s=0.005))
-        await asyncio.sleep(real_s)
+        if done is None:
+            await until(lambda: task.done(), timeout=real_s)
+            reached = True
+        else:
+            reached = await until(lambda: task.done() or done(conn))
         stop.set()
         await asyncio.wait_for(task, 10)
         await adv
+        assert reached, "terminal condition not reached"
     asyncio.run(go())
 
 
@@ -463,8 +495,12 @@ def test_startup_to_settlement_end_to_end(env, monkeypatch):
     def prints(close_e, now_e):
         n = int(60 - (close_e - now_e))
         return (77700.0 * n, n, "coinbase_proxy") if n > 0 else (0.0, 0, "none")
+    def settled(c):
+        return c.execute("SELECT COUNT(*) FROM rx_orders WHERE state='filled'").fetchone()[0] == 3 \
+            and c.execute("SELECT COUNT(*) FROM rw_positions").fetchone()[0] == 0 \
+            and c.execute("SELECT COUNT(*) FROM rx_outcomes").fetchone()[0] >= 1
     start_run(env, monkeypatch, spot_reads=fresh, prints=prints, start=CLOSE - timedelta(seconds=80),
-              step=timedelta(seconds=0.5), real_s=3.0)
+              step=timedelta(seconds=0.5), done=settled)
     assert conn.execute("SELECT status FROM rx_cohorts").fetchone()[0] == "active"
     eligible = conn.execute("SELECT COUNT(*) FROM rx_decisions WHERE eligible=1").fetchone()[0]
     assert eligible == 1                                       # one attempt per event
@@ -487,7 +523,7 @@ def test_startup_failure_releases_resources(env, monkeypatch):
     monkeypatch.setattr(rx, "manifest_body", boom)
 
     async def go():
-        await live.run(lambda: {"research_c15_enabled": True}, asyncio.Event(),
+        await live.run(lambda: {}, asyncio.Event(),
                        make_md=lambda on_event, on_cf: FakeMD(on_event, clock), send=Kalshi(clock),
                        candle_post=candles(clock), clock=clock, spot_reads=lambda: [],
                        prints=lambda c, n: (0.0, 0, "none"))
@@ -563,27 +599,44 @@ def test_old_instant_of_a_tracked_market_falls_back_to_disk_after_trim(env):
     assert x.tape_for(TICKER, probe).state_at(probe, confirmed=True) == before
 
 
-def test_switch_file_enables_without_config_key(env, monkeypatch):
+def _active(c):
+    r = c.execute("SELECT status FROM rx_cohorts").fetchone()
+    return r is not None and r[0] == "active"
+
+
+def test_switch_bound_to_this_manifest_enables_and_launches(env, monkeypatch):
+    conn, clock, spot, tmp = env
+    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
+    start_run(env, monkeypatch, spot_reads=fresh, start=CLOSE - timedelta(seconds=70), done=_active)
+
+
+@pytest.mark.parametrize("switch", [{"enabled": True}, {"enabled": False},
+                                    {"enabled": True, "manifest_id": "ef" * 32}])
+def test_unbound_or_disabled_switch_never_launches(env, monkeypatch, switch):
+    """No settings flag can enable it, a disable always wins, and a switch
+    written for another build/manifest does not apply to this one."""
     conn, clock, spot, tmp = env
     import research_preflight as pf
-    (pf.data_dir() / pf.SWITCH_NAME).write_text(json.dumps({"enabled": True}))
+    (pf.data_dir() / pf.SWITCH_NAME).write_text(json.dumps(switch))
+    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
+    conn_cfg = {"research_c15_enabled": True, "research_c15_activate": "ab" * 32}
     import kalshi_auth
     monkeypatch.setattr(kalshi_auth, "is_paper", lambda env=None: True)
     clock.t = CLOSE - timedelta(seconds=70)
-    fresh = lambda: [("coinbase_ws", clock().timestamp() - 1, 77700.0)]  # noqa: E731
 
     async def go():
         stop = asyncio.Event()
         task = asyncio.ensure_future(live.run(
-            lambda: {}, stop, make_md=lambda on_event, on_cf: FakeMD(on_event, clock),
+            lambda: conn_cfg, stop, make_md=lambda on_event, on_cf: FakeMD(on_event, clock),
             send=SettlingKalshi(clock), candle_post=candles(clock), clock=clock, spot_reads=fresh,
             prints=lambda c, n: (0.0, 0, "none"), local_time=lambda: clock().timestamp(),
             tick_s=0.005))
-        await asyncio.sleep(0.4)
+        await until(lambda: task.done(), timeout=0.5)
         stop.set()
         await asyncio.wait_for(task, 10)
     asyncio.run(go())
-    assert conn.execute("SELECT status FROM rx_cohorts").fetchone()[0] == "active"
+    assert not _active(conn)
+    assert conn.execute("SELECT COUNT(*) FROM rx_decisions").fetchone()[0] == 0
 
 
 def test_default_spot_and_print_sources_are_bound_to_the_experiment(env, monkeypatch):
@@ -604,6 +657,7 @@ def test_default_spot_and_print_sources_are_bound_to_the_experiment(env, monkeyp
     monkeypatch.setattr(spot_ws, "_client", FakeClient())
     monkeypatch.setattr(spot_ws, "is_running", lambda: True)
     monkeypatch.setattr(spot_ws, "window_partial", lambda a, c, now=None: (0.0, 0))
+    enable_switch()
     clock.t = CLOSE - timedelta(seconds=80)
 
     async def go():
@@ -615,11 +669,11 @@ def test_default_spot_and_print_sources_are_bound_to_the_experiment(env, monkeyp
                 clock.t += timedelta(seconds=0.5)
         adv = asyncio.ensure_future(advance())
         task = asyncio.ensure_future(live.run(
-            lambda: {"research_c15_enabled": True}, stop,
+            lambda: {}, stop,
             make_md=lambda on_event, on_cf: FakeMD(on_event, clock), send=SettlingKalshi(clock),
             candle_post=candles(clock), clock=clock,
             local_time=lambda: clock().timestamp(), tick_s=0.005))
-        await asyncio.sleep(1.5)
+        assert await until(lambda: task.done() or _active(conn))
         stop.set()
         await asyncio.wait_for(task, 10)
         await adv

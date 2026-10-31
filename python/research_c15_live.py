@@ -439,17 +439,17 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
         body = rx.manifest_body()
         conn.execute("BEGIN IMMEDIATE")
         mid = rx.ensure_manifest(conn, body, clock())
-        cfg = cfg_getter() or {}
         import research_preflight as _pf
+        # A switch bound to this exact manifest (by a passing preflight) is the
+        # explicit activation; nothing else can start a new cohort.
         accepting_mid = rx.select_cohort(
-            conn, mid, activate=cfg.get("research_c15_activate") or _pf.read_switch()["activate"],
-            now=clock())
+            conn, mid, activate=mid if _pf.experiment_enabled(mid) else None, now=clock())
         if accepting_mid:
             rx.setup_wallets(conn, accepting_mid)
         conn.commit()
         if accepting_mid is None:
             logger.warning(f"[c15] code/config differs from the active cohort; current manifest "
-                           f"{mid[:16]} needs research_c15_activate to start a new cohort")
+                           f"{mid[:16]} needs a passing preflight + --research-enable to start")
         cohorts = rx.runner_cohorts(conn, mid, accepting_mid)
 
         if make_md is None:
@@ -465,9 +465,9 @@ async def run(cfg_getter: Callable[[], dict], stop: asyncio.Event, *,
         import research_preflight
 
         def enabled() -> bool:
-            c = cfg_getter() or {}
-            on = bool(c.get("research_c15_enabled")) or research_preflight.read_switch()["enabled"]
-            return on and kalshi_auth.is_paper()
+            # The switch alone decides, and only for the running manifest;
+            # an explicit disable cannot be overridden by any settings flag.
+            return research_preflight.experiment_enabled(mid) and kalshi_auth.is_paper()
 
         def accepting_for(m):
             def f():

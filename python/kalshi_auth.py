@@ -253,6 +253,7 @@ def server_now() -> float:
     import time as _time
     return _time.time() + _server_offset_ms / 1000.0
 _last_sync: float = 0.0
+last_sync_ok_at: float = 0.0      # local time of the last sync that got a Date
 _RESYNC_INTERVAL_SEC = 300
 _sync_lock = threading.Lock()
 _sync_in_progress: bool = False
@@ -481,7 +482,10 @@ def clear_credentials(env: Optional[str] = None) -> None:
 
 
 def sync_server_time(force: bool = False) -> int:
-    global _server_offset_ms, _last_sync
+    """Returns the offset in ms. On failure the previous (cached) offset is
+    returned; callers that must know a fresh measurement happened compare
+    last_sync_ok_at with the time they called."""
+    global _server_offset_ms, _last_sync, last_sync_ok_at
     now_local = time.time()
     if (not force) and (now_local - _last_sync) < _RESYNC_INTERVAL_SEC:
         return _server_offset_ms
@@ -494,6 +498,7 @@ def sync_server_time(force: bool = False) -> int:
             server_dt = parsedate_to_datetime(date_hdr).timestamp()
             new_offset = int((server_dt - now_local) * 1000) - 750
             _server_offset_ms = new_offset
+            last_sync_ok_at = time.time()
             logger.debug(f"Kalshi clock sync: offset = {new_offset} ms")
     except Exception as e:
         logger.warning(f"Kalshi clock sync failed ({e})")

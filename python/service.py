@@ -1226,18 +1226,16 @@ _rx_task = None
 
 
 def _spawn_research_c15() -> None:
-    """Frozen paper research experiment. Runs when research_c15_enabled in
-    Paper mode, and ALSO whenever an earlier cohort still has pending orders
+    """Frozen paper research experiment. Runs when the research switch is
+    enabled (research_preflight.experiment_enabled) in Paper mode, and ALSO whenever an earlier cohort still has pending orders
     or open positions to resolve (settle-only). Entry acceptance is checked
     every tick inside the task, so later enable/disable or mode changes apply
     without a restart."""
     global _rx_task
     if _rx_task is not None and not _rx_task.done():
         return
-    cfg = STATE.cfg or {}
     import research_preflight
-    want = ((bool(cfg.get("research_c15_enabled")) or research_preflight.read_switch()["enabled"])
-            and kalshi_auth.is_paper())
+    want = research_preflight.experiment_enabled() and kalshi_auth.is_paper()
     if not want:
         try:
             with db.get_db() as conn:
@@ -3492,9 +3490,8 @@ if __name__ == "__main__":
         sys.exit(research_preflight.main())
     if "--research-enable" in sys.argv[1:] or "--research-disable" in sys.argv[1:]:
         import research_preflight
-        args = sys.argv[1:]
-        act = args[args.index("--activate") + 1] if "--activate" in args[:-1] else None
-        sys.exit(research_preflight.set_switch("--research-enable" in args, act))
+        # Disable wins if both are given.
+        sys.exit(research_preflight.set_switch("--research-disable" not in sys.argv[1:]))
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
